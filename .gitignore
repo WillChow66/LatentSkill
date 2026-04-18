@@ -1,0 +1,45 @@
+# Large reference clones (don't commit)
+SkillRL/
+LatentMem/
+TokMem/
+alfworld_official/
+related work/
+
+# Outputs and caches
+logs/
+wandb/
+outputs/
+results/
+checkpoints/
+models/
+data/debug_composer/
+data/latent_library/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Local config / secrets
+*.env
+.env
+.vscode/
+.idea/
+
+# Large data files
+*.pt
+*.bin
+*.safetensors
+*.parquet
+*.json
+!**/skill_token_map.json
+!**/claude_style_skills.json
+!data/.gitkeep
+
+# Misc
+*.log
+*.swp
+.DS_Store
+scripts/setup_env.sh

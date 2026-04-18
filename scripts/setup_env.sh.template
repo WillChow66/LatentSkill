@@ -1,0 +1,27 @@
+#!/bin/bash
+# Environment setup for latentskill experiments on NCSA DeltaAI
+
+module load python/miniforge3_pytorch/2.10.0
+eval "$(conda shell.bash hook)"
+
+export OPENBLAS_NUM_THREADS=8
+
+# HF cache on work storage (avoid home quota issues)
+# Use bfdz (new project, has free space) - bdns is FULL
+export HF_HOME=/work/nvme/bfdz/xzhou10/huggingface
+export HF_HUB_CACHE=/work/nvme/bfdz/xzhou10/huggingface/hub
+export HF_DATASETS_CACHE=/work/nvme/bfdz/xzhou10/huggingface/datasets
+export TMPDIR=/work/nvme/bfdz/xzhou10/tmp
+
+# Wandb
+export WANDB_API_KEY=YOUR_WANDB_API_KEY_HERE  # https://wandb.ai/settings → API keys
+export WANDB_PROJECT=latentskill
+export WANDB_ENTITY=medagent
+# User site-packages (pip --user installs go here, miniforge base is read-only)
+export PYTHONPATH="/u/xzhou10/.local/lib/python3.12/site-packages:/u/xzhou10/latentskill:/u/xzhou10/latentskill/SkillRL:${PYTHONPATH}"
+
+# ALFWORLD_DATA: official alfworld-download data
+export ALFWORLD_DATA="/u/xzhou10/latentskill/alfworld_official"
+
+# Add SkillRL's alfworld package to Python path
+export PYTHONPATH="/u/xzhou10/latentskill/SkillRL/agent_system/environments/env_package/alfworld:${PYTHONPATH}"
