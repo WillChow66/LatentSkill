@@ -38,13 +38,22 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
-def build_skill_token_names(latent_library_data: dict) -> list[str]:
+def _suffix_for(j: int) -> str:
+    """Map latent index j → token suffix. Uses a, b, c, ... for j<26 then a0,a1,...
+    Stable & readable for any k up to 36, and unique for any k via numeric fallback."""
+    if j < 26:
+        return chr(ord("a") + j)
+    return f"x{j}"  # numeric fallback (unlikely to hit; we use k≤8)
+
+
+def build_skill_token_names(latent_library_data: dict) -> tuple:
     """Build ordered list of special token names from latent library.
 
-    Each skill gets 2 tokens: SKILL_{id}_a and SKILL_{id}_b.
-    Returns list of token name strings.
+    Each skill gets ``latents_per_skill`` tokens: SKILL_{id}_a, SKILL_{id}_b, ...
+    Returns (token_names, sorted_hashes).
     """
     skill_index = latent_library_data["skill_index"]
+    k = latent_library_data["latents_per_skill"]
     token_names = []
 
     # Sort by skill_id for deterministic ordering
@@ -52,8 +61,8 @@ def build_skill_token_names(latent_library_data: dict) -> list[str]:
 
     for h in sorted_hashes:
         skill_id = skill_index[h]["id"]
-        token_names.append(f"SKILL_{skill_id}_a")
-        token_names.append(f"SKILL_{skill_id}_b")
+        for j in range(k):
+            token_names.append(f"SKILL_{skill_id}_{_suffix_for(j)}")
 
     return token_names, sorted_hashes
 
@@ -119,7 +128,7 @@ def expand_vocab(
         skill_id = lib_data["skill_index"][h]["id"]
 
         for j in range(latents_per_skill):
-            token_name = f"SKILL_{skill_id}_{'a' if j == 0 else 'b'}"
+            token_name = f"SKILL_{skill_id}_{_suffix_for(j)}"
             token_id = tokenizer.convert_tokens_to_ids(token_name)
 
             if token_id == tokenizer.unk_token_id:
@@ -146,14 +155,13 @@ def expand_vocab(
     for h in sorted_hashes:
         skill_id = lib_data["skill_index"][h]["id"]
         skill_type = lib_data["skill_index"][h]["type"]
-        token_a = f"SKILL_{skill_id}_a"
-        token_b = f"SKILL_{skill_id}_b"
+        tokens = [f"SKILL_{skill_id}_{_suffix_for(j)}" for j in range(latents_per_skill)]
+        token_ids = [tokenizer.convert_tokens_to_ids(t) for t in tokens]
         skill_token_map[skill_id] = {
             "hash": h,
             "type": skill_type,
-            "tokens": [token_a, token_b],
-            "token_ids": [tokenizer.convert_tokens_to_ids(token_a),
-                          tokenizer.convert_tokens_to_ids(token_b)],
+            "tokens": tokens,
+            "token_ids": token_ids,
         }
 
     with open(output_dir / "skill_token_map.json", "w") as f:

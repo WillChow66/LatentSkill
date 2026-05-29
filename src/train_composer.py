@@ -267,13 +267,23 @@ def train_composer(
     # Load SFT data
     dataset = ComposerDistillationDataset(sft_data_path, tokenizer, max_length)
 
-    # Optimizer (only query_latents)
+    # Optimizer (only query_latents) — aligned with verl/SkillRL SFT defaults
     optimizer = torch.optim.AdamW(
-        [composer.query_latents], lr=lr, weight_decay=0.0
+        [composer.query_latents], lr=lr, weight_decay=0.0,
+        betas=(0.9, 0.95),  # verl/SkillRL SFT default
+    )
+
+    # Cosine LR schedule with warmup (verl/SkillRL SFT default warmup_ratio=0.1)
+    from transformers import get_cosine_schedule_with_warmup
+    total_steps = epochs * len(dataset)
+    warmup_steps = int(total_steps * 0.1)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps,
     )
 
     # Training loop
-    logger.info(f"Training for {epochs} epochs, lr={lr}, {len(dataset)} samples")
+    logger.info(f"Training for {epochs} epochs, lr={lr}, {len(dataset)} samples; "
+                f"betas=(0.9, 0.95), cosine schedule, warmup={warmup_steps}/{total_steps} steps")
 
     for epoch in range(epochs):
         total_loss = 0.0
@@ -394,7 +404,9 @@ def train_composer(
             # Log gradient norm for monitoring
             grad_norm = composer.query_latents.grad.norm().item() if composer.query_latents.grad is not None else 0.0
 
+            torch.nn.utils.clip_grad_norm_([composer.query_latents], 1.0)
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
             n_samples += 1
