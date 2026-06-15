@@ -43,3 +43,8 @@ __pycache__/
 *.swp
 .DS_Store
 scripts/setup_env.sh
+
+# Modal upload staging (temp copies of code)
+.modal_stage/
+.modal_stage_rl/
+.modal_stage_rl/

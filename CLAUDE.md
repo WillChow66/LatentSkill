@@ -115,26 +115,143 @@ value beyond what scaffold + Actor adaptation provides.
 
 ---
 
-## Current Eval Results (sampling protocol — temp=0.4 sampled, history=10)
+## ⚠️ PARSER FIX WATERSHED (Jun 9) — ALL numbers below this section are OLD-PARSER and DEPRECATED
 
-| Model | Skill | Success | Avg tok/ep | Notes |
-|---|---|:-:|:-:|---|
-| Baseline (Qwen2.5-7B-Instruct) | text | 0/140 (0%) | — | no skill in prompt |
-| **SkillRL SFT** (Jianwen, v2 explicit flags) | text | **16/140 (11.4%)** | 76K | text-skill SFT baseline |
-| **Path 1 UNTRAINED Composer k=2** | latent | **33/140 (23.6%)** | 39K | random ql + raw 3B |
-| **Path 1 TRAINED Composer k=2 (clean, bug-fixed)** | latent | **54/140 (38.6%)** | 37K | **+15% over UNTRAINED ✓** |
-| Path 1 TRAINED Composer k=2 (buggy, embed-frozen) | latent | 29/140 (20.7%) | 37K | bug masked benefit |
-| Path 1 UNTRAINED Composer k=8 | latent | 43/140 (30.7%) | 39K | k↑ helps random encoder |
-| Path 1 TRAINED Composer k=8 (clean) | latent | 46/140 (32.9%) | 37K | **k=8 → encoder-output collapse, ≈ UNTRAINED** |
-| **Path 2 results** | — | TBD | — | jobs 2268392/393 running |
-| **SkillRL RL** (Jianwen, upper bound) | text | **123/140 (87.9%)** | 80K | full RL ceiling |
+**Root cause found by user questioning "no-skill 0.7% vs paper 14.8%"**: the strict
+`alfworld_projection` parser ONLY accepted literal `<action>...</action>`. Weak /
+format-unstable models (vanilla base, k=1, partially all latent variants) emit
+`[action]`/`[action>` variants ~half the time → every such step rejected → scores
+systematically deflated. RL ckpt unaffected (always emits `<action>`).
+
+**Fix**: robust parser in `SkillRL/.../alfworld/projection.py` extracts action content
+from any `<`/`[` action wrapper (strict form is a subset; think-tag + Chinese checks kept).
+Unit-tested on real base-model outputs.
+
+**Validated anchors (NEW parser, 140 ep, T=0.4)**:
+| Model | OLD parser | NEW parser |
+|---|:-:|:-:|
+| SkillRL RL ckpt (anchor) | 87.9% | **88.6%** ✓ holds |
+| vanilla 7B, NO skill | 0.7% | **42.1%** (!!) |
+
+**Implication**: the entire old control suite (no-skill 0.7% ≪ UNTRAINED 23.6% ≪ TRAINED
+38-50%) conflated SKILL INFORMATION with FORMAT ANCHORING (latents trained on `<action>`
+SFT data stabilize the actor's output format → looked stronger under the strict parser).
+The k=1 "format corruption 0%" was the tip of this iceberg. All numbers below this block
+were measured with the OLD parser and are DEPRECATED.
+
+## ✅ FINAL NEW-PARSER RESULTS (Jun 10-11) — paper-grade tables
+
+### Control suite (vanilla frozen 7B actor, 140 ep, T=0.4, robust parser)
+
+| condition | success | tok/ep |
+|---|:-:|:-:|
+| UNTRAINED latents same-7B (raw-7B encode, k=8/k=32) | 7.1% / 0% | — |
+| RANDOM latents (norm-matched noise) | 36.4% | — |
+| **no skill** | **42.1%** | 34K |
+| text skills in-context (top-6, ~16 skills) | 43.6% | 62K |
+| text skills FULL (top-12, ~17 skills = same set as latent) | 44.3% | 69K |
+| UNTRAINED latents (raw-**3B** encode, has random proj) | 44.3% | — |
+| TRAINED latents k=8 (best single lib) | 50.0-52.9% | ~33K |
+| SkillRL **SFT** ckpt (text; their cold-start *damages* the actor) | **15.0%** | 74K |
+| SkillRL **RL** ckpt (text, ceiling) | **88.6%** | 80K |
+
+**UNTRAINED same-7B = 7.1% (not a bug)**: metadata verified identical to TRAINED
+(44 skills, Identity proj since D==D, seed 42, latent norm 246≈235). Raw-7B encodes a
+*structured-but-harmful* direction (worse than random noise's 36.4%). Contrast the raw-**3B**
+UNTRAINED 44.3%: its random 3B→7B projection scrambles the harmful direction into benign
+noise; same-7B has Identity proj so the harm hits the frozen actor undiluted. → "training
+the composer" provides +43-49pp over untrained same-model encode. Actor frozen confirmed
+(q_proj=74.5417 unchanged all of training; "leak" log was a wrong-ref false alarm).
+
+### Full k-table (same-7B composer, frozen actor, epoch4; every draw = independent training, NEW parser)
+
+| k | n | mean ± std | min–max | note |
+|---|:-:|:-:|:-:|---|
+| 1 | 1 | 51.4 | — | old "0%" was PURE parser artifact (format bias, content fine) |
+| 2 | 6 | 39.9 ± 9.8 | 25.0–50.7 | unstable, below baseline on avg |
+| 4 | 3 | 43.8 ± 2.0 | 41.4–46.4 | ≈ baseline |
+| 6 | 3 | 43.6 ± 3.6 | 40.7–48.6 | ≈ baseline |
+| 8 | 6 | 45.1 ± 6.3 | 32.9–52.9 | +3.0pp, n.s. (t≈1.2) |
+| 16 | 3 | 40.0 ± 3.5 | 35.7–44.3 | ≈ baseline |
+| **32** | **6** | **49.1 ± 6.2** | 41.4–58.6 | **+7.0pp vs no-skill, t≈2.8 — only k with a significant edge** |
+
+**Honest k-story**: NO LatentMem-style monotonicity under frozen-actor SFT. Training-run
+variance (solutions nearly orthogonal even at same seed — cross-batch lib cossim 0.08-0.2)
+dominates the k-effect; only k=32 clears the baseline significantly. k=1's 51.4 (n=1) shows
+even a single latent can carry the info once format noise is tolerated by the parser.
+
+### LoRA composer (B-arm) vs full-FT (A-arm) — same protocol, seed42 single draw, NEW parser
+
+LoRA = LatentMem-exact recipe (r16/α32/dropout0.1, targets q_proj,v_proj). Trained on Modal
+(DeltaAI quota exhausted Jun 12); eval calibrated (Modal vs cluster lib agree within ±2pp).
+
+| k | full-FT (A) | LoRA (B) |
+|---|:-:|:-:|
+| 2 | 32.9 | 13.6 |
+| 4 | 36.4 | 38.6 |
+| 6 | 40.7 | 25.7 |
+| 8 | **52.9** | 25.7 (cluster) / 33.6 (Modal) |
+| 16 | 52.9 | 26.4 |
+| 32 | 45.7 | 38.6 |
+
+**LoRA verdict**: LoRA does NOT beat full-FT and is less stable (k8/16: 25-34 vs 52.9). The
+"LoRA prevents overfitting" hypothesis is FALSE in our frozen-actor + two-model regime.
+LatentMem uses LoRA because of its single-model + adapting-consumer regime; ours differs →
+full-FT is the right choice. **RL starts from full-FT k=8** (baked actor ready on Modal).
+(LoRA k8 cluster 25.7 vs Modal 33.6 = training-draw variance across two independent runs,
+not an env effect — eval calibration is ±2pp.)
+
+**Pipeline story (the paper)**: latent SFT (frozen actor, 45-49%) preserves the actor and adds
+skills externally; SkillRL's text path destroys the actor at SFT (15.0%) and only recovers via
+RL (88.6%). Stage-3 RL on latents = the open match point. Eval noise ±2pp; training-draw
+noise ±2-10pp per config; report mean±std over ≥3 draws, never single runs.
+
+---
+
+# DEPRECATED OLD-PARSER HISTORY BELOW
+
+---
+
+## Current Eval Results — OLD PARSER (DEPRECATED, kept for history)
+
+**Eval protocol notes (validated Jun 4-5)**: T=0 greedy DEGRADES SkillRL RL ckpt 87.9%→70.7%
+(action loops) — paper protocol is T=0.4 sampling. Run-to-run sampling noise ≈ ±2pp
+(two T=0.4 runs: identical 123/140 aggregate but 6/140 episode flips). Gaps <4pp need 3 seeds.
+Training-seed variance is FAR larger: ±8-18pp on same config (grid, Jun 7-8).
+
+### Control suite (all on vanilla frozen Qwen2.5-7B actor)
+
+| vanilla 7B + | Success | tok/ep | Meaning |
+|---|:-:|:-:|---|
+| no skill | 1/140 (0.7%) | 41K | floor |
+| text skills in-context | 1/140 (0.7%) | 80K | vanilla can't use verbose text skills |
+| RANDOM latents (norm-matched noise) | 2/132 (~1.5%) | — | scaffold/any-vector effect ≈ nil |
+| latent UNTRAINED (raw 3B encodes) | 33/140 (23.6%) | 39K | real info flows through pretrained encoder |
+| latent TRAINED 3B k=2 | 54/140 (38.6%) | 33K | composer SFT +15pp |
+| **latent TRAINED same-7B k=8** | **71/140 (50.7%)** 🏆 | — | same-model composer, no projection |
+
+### Pipeline comparison (the paper headline)
+
+| Stage | SkillRL (text) | Ours (latent) |
+|---|:-:|:-:|
+| SFT-level | 11.4% (Jianwen SFT ckpt) | **50.7%** (same7b k=8) |
+| RL-level | **87.9%** (123/140) | TBD — Stage 3 pending |
+| tok/ep | 76-80K | 33-39K (**-55%**) |
+
+### K-sweep (Stage-2 eval; the projection story)
+
+| k | 1 | 2 | 4 | 8 |
+|---|:-:|:-:|:-:|:-:|
+| 3B composer (latent_proj 2048→3584) | 32.1% | 38.6% | 20.0% | 32.9% |
+| **same-7B composer (Identity proj)** | **0%** ⚠ anomaly | **45.7%** | **36.4%** | **50.7%** |
 
 **Key paper-grade findings**:
-1. **Latent > text in SFT-frozen-Actor regime**: even UNTRAINED 23.6% > SkillRL SFT 11.4%; **scaffold + Qwen2.5-7B's pretrained ability** explains the 30% baseline floor on latent variants.
-2. **Composer SFT meaningful at k=2**: TRAINED 38.6% > UNTRAINED 23.6% = +15% absolute = strong validation of latent-skill idea (Path 1).
-3. **Encoder-output collapse at k=8 (Path 1)**: cross-skill cossim = 1.0 across ALL 8 positions. Composer learned to ignore skill text → constant output. Even k=2 has pos-1 collapsed (cossim 0.9999). Pos-0 is the only informative slot.
-4. **Why collapse**: frozen Actor doesn't provide discriminative gradient → optimal solution is "constant latent that doesn't break Actor decoding". More capacity (k=8) = more sites to collapse.
-5. **Path 2 hypothesis (testing)**: Actor's gradient tells Composer "make latents skill-discriminative" → should resist collapse → k↑ should help (matches LatentMem published pattern).
+1. **Three-way control complete**: no-skill ≈ text ≈ random-latent ≈ 0-1.5% ≪ UNTRAINED-latent 23.6% ≪ TRAINED. Latent representation works on a frozen actor where text fails; the gain is real information through the encoder (garbage-latent control), not scaffold.
+2. **Removing cross-model projection lifts everything**: same-7B composer beats 3B at every k≥2 (+7~+18pp); k-direction flips positive (k=8 best) — closer to LatentMem's monotonic pattern. Cross-skill cossim: no dead (1.00) slots in same-7B libs vs 3B k=2 pos-1 = 1.000.
+3. **Collapse mechanism (3B + frozen actor)**: cossim→1.0 at k≥4 (all slots), partial at k=2. Frozen actor gives no discriminative gradient; cross-model projection makes it worse.
+4. **ql init scale ×0.02 is CRITICAL**: unscaled randn (LatentMem-style) k=2 = 10.0% vs 38.6%. Matches composer embedding std (3B 0.024 / 7B 0.014). Do not remove.
+5. **same-7B k=1 anomaly RESOLVED (Jun 6): format corruption, not capacity**. k=1 latents bias the frozen actor's output toward code-symbol token directions (`_FRAGMENT`/`_BOX` nearest-vocab) → emits `[action>` instead of `<action>` in 9/9 debug responses → projection.py parser rejects every action → 0%. k=2 emits proper `<action>` 11/11; multiple latents average the bias out. `<think>` reasoning coherent in both. Paper: annotate k=1 cell as "format corruption" (robustness discussion); k≥2 conclusions unaffected. Debug evidence: logs/debug_k1_2427690.out, src/debug_k1_generations.py.
+6. **Path 2 (joint 3B+7B SFT) hurt multi-step tasks** (16.4%); LoRA Path 1 weaker overall but k-direction positive (22.9%→27.9%) — low-rank resists collapse.
 
 ---
 
@@ -142,18 +259,19 @@ value beyond what scaffold + Actor adaptation provides.
 
 | Path | What |
 |------|------|
-| `/work/nvme/bdns/xzhou10/huggingface/hub/datasets--Jianwen--SkillRL-SFT-Data/snapshots/bd3996c4e863ac59e6e4ab35549cf3741faf5e4f/alfworld/train-00000-of-00001.parquet` | SFT data (SkillRL parquet) |
+| `/work/nvme/bfdz/xzhou10/huggingface/hub/datasets--Jianwen--SkillRL-SFT-Data/snapshots/bd3996c4e863ac59e6e4ab35549cf3741faf5e4f/alfworld/train-00000-of-00001.parquet` | SFT data (SkillRL parquet) — **re-downloaded to bfdz Jun 5; the entire `/work/nvme/bdns/xzhou10/` dir was purged** |
 | `/work/nvme/bfdz/xzhou10/checkpoints/skillrl_alfworld_rl_hf/` | Jianwen SkillRL RL ckpt merged to HF (text-skill RL baseline reference) |
 | **Path 1 outputs** | |
 | `/work/nvme/bfdz/xzhou10/checkpoints/composer_sft_clean/` | Stage 1 trained Composer (k=2, embed-untied) |
 | `/work/nvme/bfdz/xzhou10/checkpoints/latent_lib_trained_clean/` | Stage 2 TRAINED k=2 latent library + actor_expanded_vocab |
 | `/work/nvme/bfdz/xzhou10/checkpoints/latent_lib_untrained/` | Stage 2 UNTRAINED k=2 latent library + actor_expanded_vocab |
 | (k=8 ckpts deleted post-collapse-finding; eval JSONs preserved in `results/`) | |
-| **Path 2 outputs** | |
-| `/work/nvme/bfdz/xzhou10/checkpoints/joint_path2_trained/` | Path 2 TRAINED full SFT (4 epoch) — composer + actor + ql files saved |
-| `/work/nvme/bfdz/xzhou10/checkpoints/joint_path2_untrained/` | Path 2 UNTRAINED ablation (only actor saved; composer/ql/proj frozen at random init) |
-| `/work/nvme/bfdz/xzhou10/checkpoints/latent_lib_path2_trained/` | Path 2 Stage 2 TRAINED latent library + actor_expanded_vocab (baked into Path-2-trained Actor) |
-| `/work/nvme/bfdz/xzhou10/checkpoints/latent_lib_path2_untrained/` | Path 2 Stage 2 UNTRAINED — encoded with raw composer + saved-random ql/proj, baked into Path-2-untrained-trained Actor |
+| **Same-model (7B composer) outputs — CURRENT CHAMPIONS (Jun 5)** | |
+| `/work/nvme/bfdz/xzhou10/checkpoints/composer_same7b_k8/` | 7B composer full-FT ZeRO-2, frozen 7B actor, k=8 → **50.7% champion** |
+| `/work/nvme/bfdz/xzhou10/checkpoints/latent_lib_same7b_k8/` | k=8 library + actor_expanded_vocab (baked into vanilla 7B) — **Stage 3 RL starting point** |
+| `/work/nvme/bfdz/xzhou10/checkpoints/composer_same7b_k2/` + `latent_lib_same7b_k2/` | k=2 runner-up (45.7%) — token-efficiency candidate for RL |
+| `/work/nvme/bfdz/xzhou10/checkpoints/latent_lib_same7b_k1/` | k=1 lib.pt only (anomaly resolved: format corruption; baked actor deleted) |
+| (Path 2 / LoRA / noscale / 3B-sweep k1,3,4 ckpts deleted post-eval; all eval JSONs in `results/`, small lib.pt files preserved) | |
 | **Stage 3 RL outputs** | |
 | `/work/nvme/bfdz/xzhou10/checkpoints/rl_trained_composer/` | Stage 3 TRAINED RL ckpts |
 | `/work/nvme/bfdz/xzhou10/checkpoints/rl_untrained_composer/` | Stage 3 UNTRAINED RL ckpts |
@@ -282,7 +400,7 @@ If tight: drop Composer to rank 0 only + broadcast results, saves 3×6=18GB.
   - `/work/nvme/bdns/xzhou10/`: **FULL** (read-only in practice — only the SFT parquet lives here)
   - `/work/nvme/bfdz/xzhou10/`: shared with other group members; aim to keep <100GB
   - HF cache + checkpoints → `bfdz`
-  - Other project HF cache: `/work/hdd/bfdz/xzhou10/.cache/huggingface/` (~306GB, MUA-RL/LoopTool/Qwen3 — DO NOT delete)
+  - Other project HF cache: `/work/hdd/bfdz/xzhou10/.cache/huggingface/` (~125GB, Qwen3 base models only — MUA-RL-32B/14B/8B + LoopTool-32B/8B caches deleted Jun 6 to free ~181GB; all re-downloadable from HF hub)
 
 ## Critical Version Pins
 
@@ -315,7 +433,7 @@ needed** in current design — Composer is frozen during RL, latents are static
 
 ## Known Issues / Watchouts
 
-1. **`/work/nvme/bdns/xzhou10` is FULL** — write to `bfdz` only
+1. **`/work/nvme/bdns/xzhou10` was PURGED entirely (discovered Jun 5)** — SFT parquet re-downloaded to bfdz HF cache (same snapshot bd3996c4); Jianwen--Alfworld-7B-SFT snapshot also lost (re-downloadable from HF hub if needed). Legacy v2 ckpts (`latent_skills_token_v2` etc) are gone for good — legacy scripts referencing them are dead.
 2. **`/work/nvme/bfdz` shared with other users** — periodically free unused ckpts (k=8 ablation deleted, eval JSONs preserved)
 3. **wandb entity**: `medagent` (personal entity disabled). Project: `latentskill`
 4. **Ray OOM monitor**: disabled via `RAY_memory_monitor_refresh_ms=0`

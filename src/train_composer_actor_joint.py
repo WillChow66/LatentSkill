@@ -50,10 +50,32 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedul
 
 logger = logging.getLogger(__name__)
 
+SKILLRL_ROOT = Path(__file__).parent.parent / "SkillRL"
+from src.encode_latent_library import build_latent_library
+
 SKILLS_START_MARKER = "## Retrieved Relevant Experience"
 SKILLS_END_MARKER = "## Current Progress"
 PLACEHOLDER = "[LATENT_SKILLS]"
 ASSISTANT_MARKER = "<|im_start|>assistant\n"
+
+
+def _count_collapsed_slots(latent_library, k, thresh=0.99):
+    """Per-slot cross-skill mean cosine sim; count slots with sim>thresh (collapsed).
+    Quick health readout logged alongside each per-epoch lib."""
+    import torch as _t
+    keys = sorted(latent_library.keys())
+    if len(keys) < 2:
+        return 0
+    stacked = _t.stack([latent_library[h].float() for h in keys])  # (n, k, D)
+    n = stacked.shape[0]
+    dead = 0
+    for j in range(k):
+        v = _t.nn.functional.normalize(stacked[:, j, :], dim=-1)
+        sim = v @ v.T
+        off = sim[~_t.eye(n, dtype=bool)].mean().item()
+        if off > thresh:
+            dead += 1
+    return dead
 
 
 # ----------------------------------------------------------------------- #
@@ -225,7 +247,7 @@ def save_checkpoint(accelerator, composer, actor, query_latents, latent_proj,
                     latents_per_skill, composer_tok, actor_tok, output_dir,
                     global_step, ql_only=False, epoch=None,
                     composer_qproj_ref=None, actor_qproj_ref=None,
-                    freeze_composer=False):
+                    freeze_composer=False, freeze_actor=False):
     accelerator.wait_for_everyone()
     out = Path(output_dir)
 
@@ -270,7 +292,21 @@ def save_checkpoint(accelerator, composer, actor, query_latents, latent_proj,
             composer_tok.save_pretrained(composer_dir)
             logger.info(f"Saved Composer ckpt → {composer_dir}")
 
-    # Actor save (always trainable in Path 2)
+    # Actor save — skipped when frozen (actor unchanged = vanilla weights; bake
+    # against the original HF model instead of writing a 15 GB copy). Sanity
+    # check that frozen actor really didn't move.
+    if freeze_actor:
+        if accelerator.is_main_process:
+            actor_qproj_now = actor_inner.model.layers[0].self_attn.q_proj.weight.detach().float().norm().item()
+            diff = abs(actor_qproj_now - actor_qproj_ref) if actor_qproj_ref else -1.0
+            logger.info(f"Actor sanity (frozen): q_proj.norm={actor_qproj_now:.6f} "
+                        f"ref={actor_qproj_ref:.6f} abs_diff={diff:.6e} (MUST be 0)")
+            if actor_qproj_ref is not None and diff > 1e-6:
+                logger.error("!!! Frozen Actor q_proj CHANGED — freeze leaked!")
+            logger.info("Actor frozen → ckpt not saved (use original HF model for Stage 2 bake)")
+        accelerator.wait_for_everyone()
+        return
+
     actor_dir = out / f"actor_{suffix}"
     if accelerator.is_main_process:
         full_state = actor_inner.state_dict()
@@ -314,6 +350,26 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=10000)
     parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument("--save-composer-every-epoch", action="store_true",
+                        help="Save composer ckpt at EVERY epoch (not just the last). "
+                             "Enables offline checkpoint selection: eval each epoch's ckpt "
+                             "downstream and pick the best. ~15GB/epoch for 7B composer.")
+    parser.add_argument("--encode-lib-every-epoch", action="store_true",
+                        help="At each epoch, encode the 44 base skills IN-MEMORY and save a "
+                             "tiny lib_epoch{e}.pt (no 15GB composer ckpt). For epoch-curve "
+                             "grids: eval each lib on vanilla 7B downstream. Implies the "
+                             "composer ckpt is NOT written unless --save-composer-every-epoch.")
+    parser.add_argument("--val-fraction", type=float, default=0.0,
+                        help="Hold out this fraction of samples for per-epoch val-CE logging "
+                             "(secondary diagnostic ONLY — val-CE is misleading under encoder "
+                             "collapse; downstream eval remains the selection criterion). "
+                             "Default 0.0 = train on all data, identical to legacy protocol.")
+    parser.add_argument("--freeze-actor", action="store_true",
+                        help="Freeze the Actor; only Composer + ql + proj train. "
+                             "Combined with --composer-path == --actor-path this gives "
+                             "the same-model full-FT regime (no cross-model projection): "
+                             "7B Composer trained under ZeRO-2, 7B Actor frozen. "
+                             "Actor ckpt is NOT saved (weights unchanged).")
     parser.add_argument("--freeze-composer", action="store_true",
                         help="UNTRAINED ablation: Composer frozen at random init, "
                              "only Actor + query_latents + latent_proj train")
@@ -331,7 +387,12 @@ def main():
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         logger.info(f"Args: {vars(args)}")
         logger.info(f"World size: {accelerator.num_processes}")
-        mode = "UNTRAINED (composer frozen)" if args.freeze_composer else "TRAINED (joint)"
+        if args.freeze_composer:
+            mode = "UNTRAINED (composer frozen)"
+        elif args.freeze_actor:
+            mode = "COMPOSER-ONLY (actor frozen, same-model regime)"
+        else:
+            mode = "TRAINED (joint)"
         logger.info(f"Mode: {mode}")
 
         if not args.no_wandb:
@@ -379,7 +440,7 @@ def main():
     # Snapshot Composer ref BEFORE any wrap
     composer_qproj_ref = composer.model.layers[0].self_attn.q_proj.weight.detach().float().norm().item()
 
-    # Actor (Qwen2.5-7B), full FT, trainable in both TRAINED and UNTRAINED
+    # Actor (Qwen2.5-7B), full FT by default; frozen with --freeze-actor
     actor = AutoModelForCausalLM.from_pretrained(
         args.actor_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
     )
@@ -387,6 +448,15 @@ def main():
         actor.config.tie_word_embeddings = False
         actor.lm_head.weight = nn.Parameter(actor.lm_head.weight.data.clone())
     actor.gradient_checkpointing_enable()
+    if args.freeze_actor:
+        if args.freeze_composer:
+            raise ValueError("--freeze-actor + --freeze-composer leaves nothing trainable")
+        # Frozen actor: no param grads/optimizer states, but activations still
+        # tracked (grad flows through actor to the latents). Keep train() mode so
+        # gradient checkpointing stays active (HF bypasses it in eval mode);
+        # Qwen2.5 has no dropout, so train() forward == eval() forward.
+        for p in actor.parameters():
+            p.requires_grad = False
     actor_qproj_ref = actor.model.layers[0].self_attn.q_proj.weight.detach().float().norm().item()
 
     # Hidden-dim projection + query_latents will live INSIDE JointWrapper below
@@ -418,9 +488,23 @@ def main():
     obj_list = [valid_indices_t if accelerator.is_main_process else None]
     torch.distributed.broadcast_object_list(obj_list, src=0)
     valid_indices = obj_list[0].tolist()
-    rank_indices = valid_indices[rank::world]
+
+    # Optional val split (deterministic interleave — identical on all ranks since
+    # valid_indices was broadcast). Default --val-fraction 0.0 keeps legacy protocol.
+    if args.val_fraction > 0:
+        stride = max(2, int(round(1.0 / args.val_fraction)))
+        val_indices = valid_indices[::stride]
+        val_set = set(val_indices)
+        train_indices = [i for i in valid_indices if i not in val_set]
+    else:
+        val_indices = []
+        train_indices = valid_indices
+
+    rank_indices = train_indices[rank::world]
+    val_rank_indices = val_indices[rank::world]
     if accelerator.is_main_process:
-        logger.info(f"Per-rank: {len(rank_indices)} samples × {world} ranks = {len(valid_indices)} total")
+        logger.info(f"Per-rank: {len(rank_indices)} train × {world} ranks = {len(train_indices)} total"
+                    + (f" | val={len(val_indices)} ({args.val_fraction:.0%})" if val_indices else ""))
 
     # Wrap Composer + Actor + query_latents + latent_proj in ONE nn.Module so
     # DeepSpeed sees a single model. Required for SINGLE accelerator.prepare()
@@ -459,6 +543,9 @@ def main():
     if accelerator.is_main_process:
         if args.freeze_composer:
             logger.info("UNTRAINED variant: Composer body + query_latents + latent_proj all frozen, only Actor trains")
+        elif args.freeze_actor:
+            logger.info("COMPOSER-ONLY variant: Composer + ql + proj train, Actor frozen "
+                        f"(proj={'Identity' if D_composer == D_actor else 'Linear'})")
         else:
             logger.info("TRAINED variant: Composer + query_latents + latent_proj + Actor all trainable")
 
@@ -609,14 +696,76 @@ def main():
                 import wandb
                 wandb.log({"epoch/avg_loss": avg, "epoch/epoch": epoch + 1}, step=global_step)
 
+        # Per-epoch val-CE (secondary diagnostic; see --val-fraction help re: collapse trap)
+        if val_rank_indices:
+            v_loss, v_n = 0.0, 0
+            with torch.no_grad():
+                for vi in val_rank_indices:
+                    vbatch = make_batch(dataset[vi], composer_tok, actor_tok,
+                                        args.max_length, accelerator.device)
+                    if vbatch is None:
+                        continue
+                    v_lat = composer_encode_skills(
+                        composer_inner, query_latents, args.latents_per_skill,
+                        vbatch["skill_input_ids_list"], pad_id, D_composer,
+                    )
+                    vl = actor_forward_loss(
+                        actor_inner, vbatch["before_ids"], vbatch["after_ids"],
+                        latent_proj(v_lat), vbatch["n_after_prompt_ids"],
+                    )
+                    v_loss += vl.item(); v_n += 1
+            agg = accelerator.reduce(
+                torch.tensor([v_loss, float(v_n)], device=accelerator.device), reduction="sum")
+            if accelerator.is_main_process and agg[1] > 0:
+                val_ce = (agg[0] / agg[1]).item()
+                logger.info(f"Epoch {epoch+1} val_ce={val_ce:.4f} ({int(agg[1].item())} samples)")
+                if not args.no_wandb:
+                    import wandb
+                    wandb.log({"epoch/val_ce": val_ce}, step=global_step)
+
+        # In-memory per-epoch latent library (tiny ~MB; no 15GB composer ckpt).
+        # composer_inner is the unwrapped Qwen2 CausalLM; matches encode_one_skill's API.
+        if args.encode_lib_every_epoch and accelerator.is_main_process:
+            composer_inner.eval()
+            skills_json = str(SKILLRL_ROOT / "memory_data" / "alfworld" / "claude_style_skills.json")
+            lib = build_latent_library(
+                composer_inner, query_latents.detach(), latent_proj,
+                args.latents_per_skill, composer_tok, skills_json,
+                accelerator.device,
+                extra_meta={"epoch": epoch + 1, "seed": args.seed,
+                            "source": "in-memory per-epoch encode"},
+            )
+            lib_path = Path(args.output_dir) / f"lib_epoch{epoch+1}.pt"
+            torch.save(lib, lib_path)
+            n_dead = _count_collapsed_slots(lib["latent_library"], args.latents_per_skill)
+            logger.info(f"Saved {lib_path.name}: {len(lib['latent_library'])} skills, "
+                        f"k={args.latents_per_skill}, collapsed_slots={n_dead}/{args.latents_per_skill}")
+            if not args.freeze_composer:
+                composer_inner.train()
+        accelerator.wait_for_everyone()
+
         is_last = (epoch + 1 == args.epochs)
-        save_checkpoint(
-            accelerator, composer, actor, query_latents, latent_proj,
-            args.latents_per_skill, composer_tok, actor_tok, args.output_dir,
-            global_step, ql_only=not is_last, epoch=epoch + 1,
-            composer_qproj_ref=composer_qproj_ref, actor_qproj_ref=actor_qproj_ref,
-            freeze_composer=args.freeze_composer,
-        )
+        # Skip the heavy composer ckpt entirely when we only need per-epoch libs.
+        if args.encode_lib_every_epoch and not args.save_composer_every_epoch:
+            # Still persist the standalone ql/proj for the last epoch (cheap).
+            if is_last:
+                save_checkpoint(
+                    accelerator, composer, actor, query_latents, latent_proj,
+                    args.latents_per_skill, composer_tok, actor_tok, args.output_dir,
+                    global_step, ql_only=True, epoch=epoch + 1,
+                    composer_qproj_ref=composer_qproj_ref, actor_qproj_ref=actor_qproj_ref,
+                    freeze_composer=args.freeze_composer, freeze_actor=args.freeze_actor,
+                )
+        else:
+            save_checkpoint(
+                accelerator, composer, actor, query_latents, latent_proj,
+                args.latents_per_skill, composer_tok, actor_tok, args.output_dir,
+                global_step,
+                ql_only=(not is_last) and (not args.save_composer_every_epoch),
+                epoch=epoch + 1,
+                composer_qproj_ref=composer_qproj_ref, actor_qproj_ref=actor_qproj_ref,
+                freeze_composer=args.freeze_composer, freeze_actor=args.freeze_actor,
+            )
 
 
 if __name__ == "__main__":

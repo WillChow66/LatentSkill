@@ -20,7 +20,7 @@ cd /u/xzhou10/latentskill
 export PYTHONUNBUFFERED=1
 
 MODEL_PATH="Qwen/Qwen2.5-7B-Instruct"
-SFT_DATA="/work/nvme/bdns/xzhou10/huggingface/hub/datasets--Jianwen--SkillRL-SFT-Data/snapshots/bd3996c4e863ac59e6e4ab35549cf3741faf5e4f/alfworld/train-00000-of-00001.parquet"
+SFT_DATA="/work/nvme/bfdz/xzhou10/huggingface/hub/datasets--Jianwen--SkillRL-SFT-Data/snapshots/bd3996c4e863ac59e6e4ab35549cf3741faf5e4f/alfworld/train-00000-of-00001.parquet"
 PRETRAINED_QL="/work/nvme/bfdz/xzhou10/checkpoints/composer_sft_C/trained_query_latents.pt"
 OUTPUT_DIR="/work/nvme/bfdz/xzhou10/checkpoints/joint_sft_C_frozen_pretrained"
 

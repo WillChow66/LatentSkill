@@ -21,7 +21,7 @@ export PYTHONUNBUFFERED=1
 
 COMPOSER="Qwen/Qwen2.5-3B-Instruct"
 ACTOR="Qwen/Qwen2.5-7B-Instruct"
-SFT_DATA="/work/nvme/bdns/xzhou10/huggingface/hub/datasets--Jianwen--SkillRL-SFT-Data/snapshots/bd3996c4e863ac59e6e4ab35549cf3741faf5e4f/alfworld/train-00000-of-00001.parquet"
+SFT_DATA="/work/nvme/bfdz/xzhou10/huggingface/hub/datasets--Jianwen--SkillRL-SFT-Data/snapshots/bd3996c4e863ac59e6e4ab35549cf3741faf5e4f/alfworld/train-00000-of-00001.parquet"
 OUTPUT_DIR="/work/nvme/bfdz/xzhou10/checkpoints/composer_sft_clean"
 
 mkdir -p "$OUTPUT_DIR"

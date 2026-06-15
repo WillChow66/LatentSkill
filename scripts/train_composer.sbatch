@@ -16,7 +16,7 @@ export PYTHONUNBUFFERED=1
 
 # Use SkillRL's SFT checkpoint as the base model (agent model = encoder)
 MODEL_PATH="/work/nvme/bdns/xzhou10/checkpoints/latent_skills_fullparam/global_step_116"
-SFT_DATA="/work/nvme/bdns/xzhou10/huggingface/hub/datasets--Jianwen--SkillRL-SFT-Data/snapshots/b09e9ebebfd858379196fa2fb508f8706d251292/alfworld/train-00000-of-00001.parquet"
+SFT_DATA="/work/nvme/bfdz/xzhou10/huggingface/hub/datasets--Jianwen--SkillRL-SFT-Data/snapshots/b09e9ebebfd858379196fa2fb508f8706d251292/alfworld/train-00000-of-00001.parquet"
 SKILLS_JSON="SkillRL/memory_data/alfworld/claude_style_skills.json"
 
 python3 -m src.train_composer \

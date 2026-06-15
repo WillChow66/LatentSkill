@@ -33,6 +33,7 @@ from pathlib import Path
 from collections import OrderedDict
 
 import torch
+import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)

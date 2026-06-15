@@ -48,7 +48,7 @@ def detect_task_type(gamefile):
     return "unknown"
 
 
-def make_env_config(top_k: int = 6, history_length: int = 10):
+def make_env_config(top_k: int = 6, history_length: int = 10, use_skills: bool = True):
     skills_path = str(SKILLRL_ROOT / "memory_data" / "alfworld" / "claude_style_skills.json")
     return OmegaConf.create({
         "env": {
@@ -57,7 +57,7 @@ def make_env_config(top_k: int = 6, history_length: int = 10):
             "max_steps": 50,
             "seed": 42,
             "alfworld": {"eval_dataset": "eval_in_distribution"},
-            "use_skills_only_memory": True,
+            "use_skills_only_memory": use_skills,
             "skills_only_memory": {
                 "skills_json_path": skills_path,
                 "retrieval_mode": "template",
@@ -106,11 +106,12 @@ def run_evaluation(model_path: str, num_episodes: int = 140, max_steps: int = 50
                    device: str = "cuda", seed: int = 42, output_path: str = None,
                    top_k: int = 6, do_sample: bool = True, temperature: float = 0.4,
                    top_p: float = 1.0, max_new_tokens: int = 512,
-                   history_length: int = 10):
-    logger.info(f"=== Text Skills Evaluation: {num_episodes} episodes ===")
+                   history_length: int = 10, use_skills: bool = True):
+    mode_str = "Text Skills" if use_skills else "NO-SKILL baseline"
+    logger.info(f"=== {mode_str} Evaluation: {num_episodes} episodes ===")
     logger.info(f"Model: {model_path}")
     logger.info(f"Sampling: do_sample={do_sample} temperature={temperature} top_p={top_p}")
-    logger.info(f"Env: history_length={history_length} top_k={top_k}")
+    logger.info(f"Env: history_length={history_length} top_k={top_k} use_skills={use_skills}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -122,7 +123,7 @@ def run_evaluation(model_path: str, num_episodes: int = 140, max_steps: int = 50
     ).to(device)
     model.eval()
 
-    config = make_env_config(top_k=top_k, history_length=history_length)
+    config = make_env_config(top_k=top_k, history_length=history_length, use_skills=use_skills)
     alf_config_path = str(SKILLRL_ROOT / "agent_system" / "environments" / "env_package" / "alfworld" / "configs" / "config_tw.yaml")
 
     logger.info("Building ALFWorld environment...")
@@ -213,7 +214,7 @@ def run_evaluation(model_path: str, num_episodes: int = 140, max_steps: int = 50
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
             json.dump({
-                "mode": "text_skills",
+                "mode": "text_skills" if use_skills else "baseline",
                 "model": model_path,
                 "overall_success_rate": overall_rate,
                 "by_task_type": {k: dict(v) for k, v in results_by_type.items()},
@@ -242,6 +243,9 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--history-length", type=int, default=10)
+    parser.add_argument("--no-skills", action="store_true",
+                        help="Run TRUE no-skill baseline (no text skills in prompt). "
+                             "Default: text skills included (use_skills_only_memory=True).")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -257,4 +261,5 @@ if __name__ == "__main__":
         top_p=args.top_p,
         max_new_tokens=args.max_new_tokens,
         history_length=args.history_length,
+        use_skills=not args.no_skills,
     )

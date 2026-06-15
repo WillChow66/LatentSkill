@@ -104,6 +104,46 @@ def encode_one_skill(composer_inner, query_latents, k, skill_text, tokenizer,
     return last_hidden[0, -k:, :].cpu()  # (k, D_composer)
 
 
+@torch.no_grad()
+def build_latent_library(composer_inner, query_latents, latent_proj, k,
+                         composer_tok, skills_json, device,
+                         extra_meta=None):
+    """Encode the 44 base skills IN-MEMORY (no ckpt I/O) and return a dict in the
+    exact schema main() saves. Used by the trainer to emit a per-epoch lib.pt
+    without writing a 15GB composer checkpoint. latent_proj may be nn.Identity.
+    """
+    all_skills = extract_individual_skills(skills_json)
+    pad_id = composer_tok.pad_token_id or 0
+    latent_library, skill_index = {}, {}
+    for sk in all_skills:
+        latent_composer = encode_one_skill(
+            composer_inner, query_latents, k, sk["text"], composer_tok, pad_id,
+        )  # (k, D_composer) on CPU
+        # Match latent_proj's weight dtype (fp32 Linear vs bf16 Identity input)
+        proj_in = latent_composer.to(device)
+        if isinstance(latent_proj, nn.Linear):
+            proj_in = proj_in.to(latent_proj.weight.dtype)
+        latent_actor = latent_proj(proj_in).cpu()
+        h = hash_skill(sk["text"])
+        latent_library[h] = latent_actor.to(torch.bfloat16)
+        skill_index[h] = {"id": sk["id"], "text": sk["text"][:100], "type": sk["type"]}
+    D_composer = query_latents.shape[-1]
+    D_actor = next(iter(latent_library.values())).shape[-1]
+    out = {
+        "latent_library": latent_library,
+        "skill_index": skill_index,
+        "query_latents": query_latents.detach().cpu(),
+        "latents_per_skill": k,
+        "hidden_size": D_actor,
+        "variant": "TRAINED",
+        "D_composer": D_composer,
+        "D_actor": D_actor,
+    }
+    if extra_meta:
+        out.update(extra_meta)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--composer-ckpt", required=True,

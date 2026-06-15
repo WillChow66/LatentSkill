@@ -285,6 +285,10 @@ def main():
     parser.add_argument("--adam-beta2", type=float, default=0.95)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--latents-per-skill", type=int, default=2)
+    parser.add_argument("--ql-init-scale", type=float, default=0.02,
+                        help="query_latents init = randn(k,D) * scale. Default 0.02 "
+                             "matches Qwen2.5-3B token-embedding std (~0.024). Set 1.0 for "
+                             "LatentMem-style unscaled randn (norm ~45, out-of-distribution).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=10000)
     parser.add_argument("--log-every", type=int, default=20)
@@ -298,6 +302,9 @@ def main():
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-targets", type=str,
+                        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+                        help="Comma-separated LoRA target modules. LatentMem-exact: q_proj,v_proj")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -364,8 +371,7 @@ def main():
         peft_cfg = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
-            target_modules=["q_proj","k_proj","v_proj","o_proj",
-                            "gate_proj","up_proj","down_proj"],
+            target_modules=args.lora_targets.split(","),
             lora_dropout=args.lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
@@ -412,7 +418,7 @@ def main():
             logger.info(f"D_composer == D_actor == {D_actor}, no projection needed")
 
     # query_latents — STANDALONE Parameter (fp32 for update precision).
-    ql_init = (torch.randn(args.latents_per_skill, D_composer) * 0.02).to(torch.float32).to(accelerator.device)
+    ql_init = (torch.randn(args.latents_per_skill, D_composer) * args.ql_init_scale).to(torch.float32).to(accelerator.device)
     query_latents = nn.Parameter(ql_init, requires_grad=True)
 
     # composer_qproj_ref already captured above (before LoRA wrap)

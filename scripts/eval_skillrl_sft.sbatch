@@ -21,7 +21,7 @@ export PYTHONUNBUFFERED=1
 
 mkdir -p results
 
-SKILLRL_SFT_CKPT="/work/nvme/bdns/xzhou10/huggingface/hub/models--Jianwen--Alfworld-7B-SFT/snapshots/ba9c962eef80a49fc63a94c9728209a36057c671/checkpoint-140"
+SKILLRL_SFT_CKPT="/work/nvme/bfdz/xzhou10/huggingface/hub/models--Jianwen--Alfworld-7B-SFT/snapshots/ba9c962eef80a49fc63a94c9728209a36057c671/checkpoint-140"
 
 python3 -m src.eval_text_alfworld \
     --model "$SKILLRL_SFT_CKPT" \

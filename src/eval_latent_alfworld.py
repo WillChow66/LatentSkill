@@ -145,10 +145,20 @@ def make_env_config(history_length: int = 10, top_k: int = 6):
 
 
 @torch.no_grad()
+def skill_token_ids(tokenizer):
+    """IDs of SKILL_* special tokens (present only on vocab-expanded actors).
+    Their lm_head rows are zeroed at bake time (logit pinned to 0 ≈ never wins
+    vs typical 10-25 top logits), but explicit suppression is free insurance —
+    especially for RL-trained actors whose lm_head rows may drift from zero.
+    Returns [] on vanilla models → no-op."""
+    return [tid for tok, tid in tokenizer.get_added_vocab().items()
+            if tok.startswith("SKILL_")]
+
+
 def generate_with_latent(instruction, model, tokenizer, latent_library, skill_hashes,
                          task_description, device, do_sample: bool = True,
                          temperature: float = 0.4, top_p: float = 1.0,
-                         max_new_tokens: int = 512):
+                         max_new_tokens: int = 512, suppress_ids=None):
     """Generate action with latent skill in-place replacement."""
     start_time = time.time()
 
@@ -197,6 +207,7 @@ def generate_with_latent(instruction, model, tokenizer, latent_library, skill_ha
         top_p=top_p if do_sample else None,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        suppress_tokens=suppress_ids if suppress_ids else None,
     )
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
     output_token_count = len(outputs[0])
@@ -230,6 +241,10 @@ def run_evaluation(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    suppress_ids = skill_token_ids(tokenizer)
+    if suppress_ids:
+        logger.info(f"Suppressing {len(suppress_ids)} SKILL_* tokens at generation "
+                    f"(vocab-expanded actor detected)")
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
@@ -284,7 +299,7 @@ def run_evaluation(
                 response, in_tok, lat_tok, out_tok, elapsed = generate_with_latent(
                     instruction, model, tokenizer, latent_library, skill_hashes, task_desc, device,
                     do_sample=do_sample, temperature=temperature, top_p=top_p,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=max_new_tokens, suppress_ids=suppress_ids,
                 )
 
                 ep_input_tokens += in_tok
