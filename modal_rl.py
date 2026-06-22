@@ -159,6 +159,13 @@ def prep_resume():
 
 @app.function(image=image, gpu="H200:4", cpu=32, volumes={"/vol": vol},
               timeout=24 * 3600,
+              # SELF-HEAL: 150 epochs (~26h) > Modal's 24h timeout cap, so the run
+              # MUST cross at least one boundary. Modal retries get a FRESH 24h on
+              # each attempt (per docs) and also fire on preemption/crash → each retry
+              # re-runs train_rl which resume_mode=auto resumes from the latest durable
+              # checkpoint. Fully server-side: survives the user's machine being off.
+              retries=modal.Retries(max_retries=10, backoff_coefficient=1.0,
+                                    initial_delay=30.0),
               # OPENAI_API_KEY (X2 skill_updater; harmless when X2 off) +
               # WANDB_API_KEY (live online training curves, entity medagent).
               secrets=[modal.Secret.from_name("openai-secret"),
