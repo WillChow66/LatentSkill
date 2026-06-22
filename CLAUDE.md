@@ -402,6 +402,82 @@ If tight: drop Composer to rank 0 only + broadcast results, saves 3×6=18GB.
   - HF cache + checkpoints → `bfdz`
   - Other project HF cache: `/work/hdd/bfdz/xzhou10/.cache/huggingface/` (~125GB, Qwen3 base models only — MUA-RL-32B/14B/8B + LoopTool-32B/8B caches deleted Jun 6 to free ~181GB; all re-downloadable from HF hub)
 
+## Modal RL Migration (Jun 17) — Stage 3 GRPO on cloud (DeltaAI quota exhausted)
+
+Stage 3 RL moved to **Modal** (profile `glad-lab`, shared w/ luozheng; Volume
+`latentskill` mounted at `/vol`). All RL assets staged on the Volume:
+`/vol/rl_assets/{actor_k8_expanded_vocab, rl_parquet/{train,test}.parquet, lib_k8.pt, composer_k8_epoch4}`.
+Code (SkillRL+verl fork + src) baked from `.modal_stage_rl/` (45MB curated subset).
+`modal_rl.py` = the GRPO launcher (`import_check` / `diag` CPU probes + `train_rl` H200:4).
+
+**Image = `vllm/vllm-openai:v0.8.4` + 7 bring-up fixes (each a real, debugged坑)**:
+1. `.entrypoint([])` — base image's vllm-api-server ENTRYPOINT crash-loops the container otherwise.
+2. NO `add_python` — image's native python3.12 HAS vllm; a fresh add_python would not.
+3. `ln -sf $(command -v python3) /usr/local/bin/python` BEFORE pip — image ships only `python3`; Modal's pip step calls `python`.
+4. README.md copied into `.modal_stage_rl/SkillRL/` — verl `setup.py` reads it; `pip install -e .` crashes without it.
+5. `gigpo/core_gigpo.py` copied into staging — `ray_trainer.py` does `from gigpo import core_gigpo`; was missing from the 45MB subset.
+6. **flash_attn** prebuilt wheel `2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312` — image has only vLLM's internal kernels, not the standalone `flash_attn` pkg verl/HF need (flash_attention_2 + use_remove_padding varlen). ABI probed via `diag` (py3.12/torch2.6+cu124/**cxx11abi=False**); wrong ABI = import-ok-but-segfault.
+7. `WANDB_MODE=offline` (+ `WANDB_DIR=/vol/rl_assets/wandb`) — no api key needed; `wandb.init` would else raise UsageError. For live curves: create Modal secret `wandb-secret`, add to `train_rl` secrets, flip to online + `WANDB_ENTITY=medagent`.
+
+Also: `ppo_mini_batch_size = train_size*group_size` (was hardcoded 128 → smoke's 64-traj batch asserted).
+Secrets: `openai-secret` (X2, wired into `train_rl`; X2 still OFF in v1), `huggingface-secret`.
+
+**Smoke validated end-to-end (Jun 17)**: env init → FSDP load 7B → vLLM TP=4 gen →
+latent skill injection (`SKILL_<cat>_NNN_a..h` per-task retrieval) → `<think>/<action>` →
+alfworld scoring → robust parser. `val_before_train` runs the FULL val set (≈140 ep ×
+≤50 steps → ~slow; `--val-size` is only batch size, not episode count).
+
+### ✅ FIRST RL RESULT (v1, k=8 static latent, X2 off) — RL lifts latent skills
+
+Run `rl_k8_v1_out` (40-epoch target, online wandb `medagent/latentskill/runs/w1qapfrw`).
+Train set is TINY (~1 step/epoch → train.parquet ≈16 prompts; val = held-out ~140 ep).
+val/success_rate over GRPO steps (test_freq=5):
+
+| step | epoch | val/success_rate |
+|:-:|:-:|:-:|
+| 0 (baseline=baked actor) | 0 | 48.4% (matches Stage-2 offline ~50% ✓) |
+| 5 | 4 | 43.8% |
+| 10 | 9 | 39.1% |
+| **15** | **14** | **65.6%** 🏆 best |
+
+**Dip-then-jump** (explore/drift → breakthrough): **+17pp over baseline, +27pp over trough**.
+→ core thesis confirmed: latent skills ARE RL-optimizable. (vs text-RL ceiling 88.6%.)
+Run died at step ~16/epoch 15 (detached app ran ~2.7h then Modal-side terminated; logs
+expired). Per-step ~9-14min (val step +~3.5min).
+
+### ⚠️ CHECKPOINT DURABILITY BUG (Jun 22) — fixed
+
+v1's checkpoints were ALL CORRUPT and unresumable: `torch.load` → `RuntimeError:
+PytorchStreamReader failed reading zip archive: failed finding central directory`.
+Root cause: **Modal volume writes aren't durable until `vol.commit()`**; train_rl only
+committed at the very end, so the hard mid-run kill left the big shard files with valid
+SIZES (metadata flushed) but truncated zip tails (data not flushed). `global_step_10`
+even lost whole shards; `best` looked complete by size but its optim shard was truncated.
+**Fix**: `train_rl` now runs a background thread calling `vol.commit()` every 180s →
+every saved checkpoint becomes durable on its own. Lesson: ALWAYS periodic-commit Modal
+volumes during long jobs. → restarted clean (v2) from the baked actor.
+
+### RL training data (verified Jun 22) — IDENTICAL to SkillRL
+
+- **Game pool (the real "training set", what AlfredTWEnv samples)**: train **6374** trials
+  (2435 task configs × ~2-3 trials, 7 task types); valid_seen 251, valid_unseen 255.
+  In `SkillRL/agent_system/environments/env_package/alfworld/json_2.1.1/`. is_train →
+  `train_eval='train'` loads the full 6374 pool; each `env.reset()` draws the next (seeded).
+- **rl_parquet is NOT the dataset** — it's verl's per-step batch driver: train.parquet=16
+  rows (=train_batch_size), test.parquet=64 rows (=val_batch_size). Each row = one env slot;
+  per step 16 games sampled from the 6374 pool × group_size 8 GRPO rollouts = 128 traj/step.
+- **SkillRL's own alfworld config** (`examples/{grpo,gigpo}_trainer/run_alfworld.sh`):
+  train_data_size=16, val_data_size=128, group_size=8, total_epochs=150, max_steps=50
+  → our train batch (16×8) is IDENTICAL; we use val=64 (in-loop only; headline = 140-ep
+  offline eval) and matched total_epochs=150.
+
+### v2 run (Jun 22) — the paper run: clean, durable, SkillRL-matched
+
+`rl_k8_v2_out`, from baked actor, total_epochs=**150** (set from start so cosine LR matches
+SkillRL — must NOT do 40-then-extend, the LR horizon would differ), val=64, save_freq=10,
+periodic vol.commit active. ~26h on 4×H200, run in legs (resume_mode=auto from latest
+COMPLETE checkpoint). wandb online medagent/latentskill.
+
 ## Critical Version Pins
 
 | Package | Version | Why |

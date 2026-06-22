@@ -22,8 +22,17 @@ import modal
 app = modal.App("latentskill-rl")
 
 # vLLM official image = CUDA + torch + vllm 0.8.4 + flash-attn preinstalled (x86).
+# NOTE (Jun 15 fix): the image ships an ENTRYPOINT (vllm api_server) → Modal
+# crash-loops on container start unless cleared with .entrypoint([]). And do NOT
+# add_python: vllm lives in the image's native python; a fresh add_python 3.11
+# would not have vllm → `import vllm` fails. Use the image's python directly.
 image = (
-    modal.Image.from_registry("vllm/vllm-openai:v0.8.4", add_python="3.11")
+    modal.Image.from_registry("vllm/vllm-openai:v0.8.4")
+    .entrypoint([])
+    # image ships `python3` (with vllm) but not `python`; Modal's pip_install /
+    # runner call `python` → symlink it before any pip step. Keeps the image's
+    # vllm-bearing interpreter as the one we install into and run under.
+    .run_commands("ln -sf $(command -v python3) /usr/local/bin/python")
     .pip_install(
         "transformers==4.51.1",
         "tensordict<=0.6.2",
@@ -34,6 +43,16 @@ image = (
         "textworld==1.7.0", "fast-downward-textworld", "gymnasium==0.29.1",
         "sentence-transformers", "faiss-cpu", "networkx", "h5py",
         "opencv-python-headless", "pycocotools",
+    )
+    # flash_attn: vllm image ships only vLLM's internal kernels, NOT the standalone
+    # `flash_attn` pkg that verl/HF need for attn_implementation=flash_attention_2 +
+    # use_remove_padding (varlen). Prebuilt wheel EXACTLY matched to the image probe:
+    # py3.12 / torch2.6 / cu12 / cxx11abi=False (wrong ABI = import-ok but segfault).
+    .pip_install(
+        "https://github.com/Dao-AILab/flash-attention/releases/download/"
+        "v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-"
+        "cp312-cp312-linux_x86_64.whl",
+        "einops",
     )
     # install our verl fork editable (has the SkillRL/X2 changes)
     .run_commands("echo 'verl fork installed from /root/app/SkillRL at runtime via PYTHONPATH'")
@@ -53,6 +72,12 @@ RL_ENV = {
     "RAY_memory_monitor_refresh_ms": "0",
     "VLLM_ATTENTION_BACKEND": "FLASH_ATTN",
     "TOKENIZERS_PARALLELISM": "false",
+    # wandb ONLINE: live remote curves. Requires Modal secret `wandb-secret`
+    # (WANDB_API_KEY=...) wired into train_rl. Entity medagent (personal disabled).
+    # If the key is ever unavailable, set WANDB_MODE=offline (no key needed).
+    "WANDB_MODE": "online",
+    "WANDB_ENTITY": "medagent",
+    "WANDB_DIR": "/vol/rl_assets/wandb",
 }
 
 
@@ -83,8 +108,61 @@ def import_check():
     return "ALL IMPORT CHECKS PASSED — safe to run train_rl on H200"
 
 
+@app.function(image=image, volumes={"/vol": vol}, timeout=600)
+def diag():
+    """Cheap CPU probe of the image's torch/cuda/abi so we pick the EXACT
+    matching flash-attn prebuilt wheel (wrong ABI = import-ok but runtime segfault)."""
+    import subprocess
+    subprocess.run(["python3", "-c",
+        "import sys,torch;print('PY', sys.version.split()[0]);"
+        "print('TORCH', torch.__version__);"
+        "print('CUDA', torch.version.cuda);"
+        "print('CXX11ABI', torch.compiled_with_cxx11_abi())"], check=False)
+    for pkg in ("flash_attn", "vllm_flash_attn", "flash_attn_2_cuda"):
+        subprocess.run(["python3", "-c",
+            f"import {pkg};print('HAVE {pkg}', getattr({pkg},'__version__','(no ver)'))"],
+            check=False)
+    subprocess.run(["pip", "show", "flash-attn"], check=False)
+    print("=== VOLUME USAGE ===")
+    subprocess.run("df -h /vol; echo '--- /vol/* ---'; du -sh /vol/* 2>/dev/null; "
+                   "echo '--- /vol/rl_assets/* ---'; du -sh /vol/rl_assets/* 2>/dev/null",
+                   shell=True, check=False)
+    print("=== RL PARQUET ROW COUNTS ===")
+    subprocess.run(["python3", "-c",
+        "import pyarrow.parquet as pq\n"
+        "for n,p in [('train','/vol/rl_assets/rl_parquet/train.parquet'),"
+        "('test','/vol/rl_assets/rl_parquet/test.parquet')]:\n"
+        "    f=pq.ParquetFile(p); print(n,'rows=',f.metadata.num_rows,'cols=',f.schema_arrow.names)"],
+        check=False)
+    return "diag done"
+
+
+@app.function(image=image, volumes={"/vol": vol}, timeout=1800)
+def prep_resume():
+    """Salvage the v1 run: its `best` ckpt (step15, 65.6%) is COMPLETE but the
+    regular global_step_10 lost FSDP shards (incomplete commit on hard kill).
+    Copy best → global_step_15 + set latest_checkpointed_iteration=15 so verl
+    resume_mode=auto loads the clean step-15 state and continues to epoch 40."""
+    import subprocess, os
+    base = "/vol/rl_assets/rl_k8_v1_out"
+    src, dst = f"{base}/best/actor", f"{base}/global_step_15/actor"
+    need = f"{dst}/model_world_size_4_rank_0.pt"
+    if not os.path.exists(need):
+        os.makedirs(f"{base}/global_step_15", exist_ok=True)
+        subprocess.run(f"cp -r '{src}' '{dst}'", shell=True, check=True)
+    with open(f"{base}/latest_checkpointed_iteration.txt", "w") as f:
+        f.write("15")
+    vol.commit()
+    print("global_step_15/actor:", sorted(os.listdir(dst)))
+    return "prepped global_step_15 from best (iter=15)"
+
+
 @app.function(image=image, gpu="H200:4", cpu=32, volumes={"/vol": vol},
-              timeout=24 * 3600, secrets=[])
+              timeout=24 * 3600,
+              # OPENAI_API_KEY (X2 skill_updater; harmless when X2 off) +
+              # WANDB_API_KEY (live online training curves, entity medagent).
+              secrets=[modal.Secret.from_name("openai-secret"),
+                       modal.Secret.from_name("wandb-secret")])
 def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
              group_size: int = 8, test_freq: int = 5):
     import os
@@ -94,7 +172,11 @@ def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
                    cwd="/root/app/SkillRL", check=False)
 
     actor = "/vol/rl_assets/actor_k8_expanded_vocab"
-    out = "/vol/rl_assets/rl_k8_static_out"
+    # v2: clean restart from the baked actor. v1's checkpoints are CORRUPT — the
+    # original run was hard-killed before any vol.commit(), so its big shard files
+    # have valid sizes but truncated zip tails (torch.load → "failed finding central
+    # directory"). The periodic-commit fix above makes v2's checkpoints durable.
+    out = "/vol/rl_assets/rl_k8_v2_out"
     os.makedirs(out, exist_ok=True)
     assert os.path.exists(actor), f"baked actor missing: {actor}"
 
@@ -113,7 +195,10 @@ def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
         f"actor_rollout_ref.model.path={actor}",
         "actor_rollout_ref.actor.optim.lr=1e-6",
         "actor_rollout_ref.model.use_remove_padding=True",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=128",
+        # mini-batch = one full update over the rollout batch (train×group
+        # trajectories). Hardcoding 128 breaks the smoke (train_size 8 → only 64
+        # trajectories < 128 → verl assert). Scale it: full run 16×8=128 unchanged.
+        f"actor_rollout_ref.actor.ppo_mini_batch_size={train_size * group_size}",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=0.01",
@@ -161,15 +246,37 @@ def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
         "trainer.max_actor_ckpt_to_keep=2",
     ]
     print("=== RL:", " ".join(cmd))
-    subprocess.run(cmd, cwd="/root/app/SkillRL", check=True)
-    vol.commit()
+    # DURABILITY: Modal volume writes aren't persisted until vol.commit(); a hard
+    # mid-run kill else leaves the in-flight checkpoint with missing FSDP rank shards
+    # (exactly what corrupted global_step_10 → resume FileNotFoundError). Commit every
+    # 3 min in a background thread so every saved checkpoint becomes durable on its own.
+    import threading
+    stop_commit = threading.Event()
+    def _periodic_commit():
+        while not stop_commit.wait(180):
+            try:
+                vol.commit()
+            except Exception as e:
+                print("periodic vol.commit warning:", e)
+    committer = threading.Thread(target=_periodic_commit, daemon=True)
+    committer.start()
+    try:
+        subprocess.run(cmd, cwd="/root/app/SkillRL", check=True)
+    finally:
+        stop_commit.set()
+        vol.commit()
     return f"RL done (epochs={epochs}) -> {out}"
 
 
 @app.local_entrypoint()
 def main(epochs: int = 150, train_size: int = 16, val_size: int = 64,
-         group_size: int = 8, test_freq: int = 5, check: bool = False):
-    if check:
+         group_size: int = 8, test_freq: int = 5, check: bool = False,
+         diag_only: bool = False, prep: bool = False):
+    if prep:
+        print(prep_resume.remote())
+    elif diag_only:
+        print(diag.remote())
+    elif check:
         print(import_check.remote())
     else:
         print(train_rl.remote(epochs, train_size, val_size, group_size, test_freq))
