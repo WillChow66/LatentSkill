@@ -478,6 +478,25 @@ SkillRL — must NOT do 40-then-extend, the LR horizon would differ), val=64, sa
 periodic vol.commit active. ~26h on 4×H200, run in legs (resume_mode=auto from latest
 COMPLETE checkpoint). wandb online medagent/latentskill.
 
+### ⚠️ LAUNCH BUG (Jun 23) — the real cause of every "~2.7h death": client cancellation
+
+`modal run --detach` launched from a killable wrapper (a backgrounded shell that the
+agent harness later cleans up) gets **CANCELED** when that client is SIGTERM'd — logs show
+`[modal-client] Received a cancellation signal ... Successfully canceled input`. `--detach`
+did NOT protect it (it still streams/blocks), and **retries do NOT re-run a CANCELED call**
+(cancellation is deliberate). So the deaths were never preemption — they were the launcher
+being killed. **FIX = true server-side fire-and-forget**:
+```
+modal deploy modal_rl.py                       # persistent app (NOT ephemeral)
+PY=$(head -1 $(command -v modal) | sed 's/^#!//')   # modal's python (/usr/bin/python3.12);
+$PY -c "import modal; modal.Function.from_name('latentskill-rl','train_rl').spawn(150,16,64,8,5)"
+```
+spawn() returns immediately, the function runs on the DEPLOYED app independent of any client
+→ killing the shell / logging off the cluster can't cancel it. Monitor: `modal app logs
+latentskill-rl`. Resume after any stop: re-spawn (resume_mode=auto + durable ckpts continue).
+NOTE: `modal run … .spawn()` does NOT work — ephemeral app is torn down on client exit →
+the spawned call dies. Must be `modal deploy` first.
+
 ## Critical Version Pins
 
 | Package | Version | Why |
