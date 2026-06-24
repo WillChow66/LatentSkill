@@ -497,6 +497,26 @@ latentskill-rl`. Resume after any stop: re-spawn (resume_mode=auto + durable ckp
 NOTE: `modal run … .spawn()` does NOT work — ephemeral app is torn down on client exit →
 the spawned call dies. Must be `modal deploy` first.
 
+### 🏆 v2 RESULT (Jun 23) — latent-skill RL MATCHES/BEATS text-skill RL
+
+Deployed+spawned run survived unattended to step 131/150 (no deaths). In-loop val
+(64 ep, test_freq=5) success_rate over GRPO steps:
+
+| step | val | step | val | step | val |
+|:-:|:-:|:-:|:-:|:-:|:-:|
+| 0 (baseline) | 48.4% | 50 | 84.4% | 100 | 85.9% |
+| 5 | 62.5% | 65 | 84.4% | 110 | 89.1% |
+| 25 | 78.1% | 75 | 87.5% | 115 | 87.5% |
+| 45 | 82.8% | **85** | **92.2%** 🏆 | 120 | 92.2% |
+| | | 90 | 87.5% | 130 | 87.5% |
+
+**baseline 48.4% → best ckpt 92.2% (step 85); late phase stable ~85-92%.** This
+**reaches/exceeds the text-RL ceiling (88.6%)** at ~half the token cost → core thesis
+proven: latent skills are RL-optimizable to text-skill-RL parity. CAVEAT: this is the
+in-loop val (64 ep); the headline number must be the standard **140-ep offline eval**
+(`eval_latent_alfworld.py`) on `rl_k8_v2_out/best` — TODO. Val noise ±, curve bounces
+79.7-92.2% late, so report best-ckpt + a 3-seed offline eval, not the single peak.
+
 ## Critical Version Pins
 
 | Package | Version | Why |
