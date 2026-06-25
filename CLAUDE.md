@@ -662,3 +662,45 @@ CAVEAT (honest): SkillRL on our harness (85.7% in-dist) is below its paper's 89.
 its ckpt with the static base skills (its trained DYNAMIC skill bank isn't reproduced), which
 may under-represent it; even vs its own 89.9%, ours (92.9%, X2 OFF) is ahead. OOD is novel
 (SkillRL paper reports no unseen number). Our step140 corroborates: in-dist 92.9%, OOD 82.1%.
+
+### Hyperparameter parity with SkillRL (verified Jun 25, run_alfworld_skills.sh)
+
+SkillRL's ACTUAL skill method = `examples/grpo_trainer/run_alfworld_skills.sh` (NOT the
+GRPO baseline run_alfworld.sh, which has use_retrieval_memory=False / max_prompt 2048).
+Our RL config is IDENTICAL to it:
+
+| HP | SkillRL skills | Ours | match |
+|---|:-:|:-:|:-:|
+| lr | 1e-6 | 1e-6 | ✓ |
+| train_batch_size | 16 | 16 | ✓ |
+| val_data_size | 64 | 64 | ✓ |
+| group_size (rollout.n) | 8 | 8 | ✓ |
+| ppo_mini_batch_size | 128 | 128 | ✓ |
+| ppo_micro_batch_size_per_gpu | 4 | 4 | ✓ |
+| kl_loss_coef | 0.01 | 0.01 | ✓ |
+| max_prompt_length | 4096 | 4096 | ✓ |
+| max_response_length | 512 | 512 | ✓ |
+| total_epochs | 150 | 150 | ✓ |
+| temperature | 0.4 | 0.4 | ✓ |
+| top_k retrieval | 6 | 6 | ✓ |
+
+**Only substantive difference: X2 dynamic skill evolution — SkillRL ON
+(enable_dynamic_update=True), ours OFF.** So our 92.9%/88.1% (X2 OFF) matches/beats their
+full method (X2 ON, paper 89.9% in-dist). (val_before_train trivially differs: theirs
+False, ours True — a step-0 eval only.) NOTE: paper Table 4's max_prompt 6000/resp 1024 ≠
+the released skills script (4096/512); the script is authoritative. Our SkillRL ckpt eval
+used max_prompt 6000 (generous, avoids truncating their long text skills) → fair/upper-bound
+for them.
+
+### Code structure: ours vs SkillRL (what verl_patches/ changes)
+
+SAME RL stack (their verl GRPO + vLLM + ray + FSDP fork). Our changes (all in verl_patches/):
+- **Skill representation** (the core difference): ours = LATENT (Composer compresses each
+  skill → k=8 vectors, baked into actor vocab as trainable SKILL_* rows w/ untied LM head);
+  theirs = TEXT skills injected as prompt text. `skills_only_memory.py` adds latent_token_mode
+  (+ latents_per_skill) to emit SKILL_<cat>_NNN_a..h vs text; `env_manager.py` plumbs it.
+- **projection.py**: robust action parser (the watershed fix).
+- **verl workers** (fsdp_workers / ray_trainer / dp_actor / dp_critic / fsdp_vllm / vllm_utils):
+  X2 Composer-encode hooks (dyn skill → latent into vLLM vocab), tensordict .keys() fix,
+  LoRA-import try/except, best-ckpt tracking.
+- **NEW pipeline not in SkillRL**: the whole Composer SFT (Stage 1-2) that produces latents.
