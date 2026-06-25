@@ -539,9 +539,26 @@ text-RL 88.6% anchor (same 140-ep protocol). Concern resolved in our favor.
 died on this). So (a) volume is only ~170GB not 1.3TB, (b) we can ONLY eval 140 & 150
 (the val-peak best/85 is unrecoverable). **Fine** — we report the UNBIASED late ckpts,
 not a val-selected one. **Future runs: set `max_actor_ckpt_to_keep` high (or -1) if you
-want to eval the trajectory / a val-peak ckpt.** Rigorous table = {140,150} × {in-dist,
-OOD valid_unseen}, 140 ep each (150-indist=92.9% done; others running). TODO: re-eval the
-text-RL ckpt on this same harness for airtight apples-to-apples.
+want to eval the trajectory / a val-peak ckpt.** Rigorous table = {140,150} × {in-dist, OOD valid_unseen} (150-indist=92.9% done).
+
+### Eval-set sizes (verified Jun 23) — env uses solvable COMPILED games, not raw trials
+
+`find traj_data.json` overcounts (251 valid_seen / 255 valid_unseen raw trial dirs). The
+env (`collect_game_files`) loads `game.tw-pddl` with `solvable:true` → actual pools:
+**valid_seen = 140 games (eval_in_distribution), valid_unseen = 134 games
+(eval_out_of_distribution)** — exactly the standard ALFWorld seen/unseen sizes; train=3553.
+So `val_size=140` already = the FULL in-dist set (our 92.9% is NOT a sub-sample), and OOD
+must use `val_size=134`.
+
+⚠️ **OOD was missing on Modal**: the volume's `alfworld_data/json_2.1.1` only had
+train+valid_seen → first OOD evals ran "0 games" (useless). Fixed: uploaded
+`valid_unseen` (80MB, 134 solvable games) to the volume. Re-ran OOD at n=134.
+
+**Fair comparison (same harness, full pools)**: `val_eval` (latent, our ckpt) + `val_eval_text`
+(SkillRL text ckpt: model.path=uploaded `skillrl_text_rl_hf`, resume_mode=disable,
+latent_token_mode=False, native 6000/1024 so its text skills aren't truncated). Matrix:
+{ours k=8 step150, SkillRL} × {valid_seen 140, valid_unseen 134}. SkillRL paper reports
+89.9% on "ALFWorld validation set" (= valid_seen; our anchor 88.6% on 140-ep valid_seen).
 
 ## Critical Version Pins
 
