@@ -48,7 +48,8 @@ def detect_task_type(gamefile):
     return "unknown"
 
 
-def make_env_config(top_k: int = 6, history_length: int = 10, use_skills: bool = True):
+def make_env_config(top_k: int = 6, history_length: int = 10, use_skills: bool = True,
+                    eval_dataset: str = "eval_in_distribution"):
     skills_path = str(SKILLRL_ROOT / "memory_data" / "alfworld" / "claude_style_skills.json")
     return OmegaConf.create({
         "env": {
@@ -56,7 +57,7 @@ def make_env_config(top_k: int = 6, history_length: int = 10, use_skills: bool =
             "history_length": history_length,
             "max_steps": 50,
             "seed": 42,
-            "alfworld": {"eval_dataset": "eval_in_distribution"},
+            "alfworld": {"eval_dataset": eval_dataset},
             "use_skills_only_memory": use_skills,
             "skills_only_memory": {
                 "skills_json_path": skills_path,
@@ -106,7 +107,8 @@ def run_evaluation(model_path: str, num_episodes: int = 140, max_steps: int = 50
                    device: str = "cuda", seed: int = 42, output_path: str = None,
                    top_k: int = 6, do_sample: bool = True, temperature: float = 0.4,
                    top_p: float = 1.0, max_new_tokens: int = 512,
-                   history_length: int = 10, use_skills: bool = True):
+                   history_length: int = 10, use_skills: bool = True,
+                   eval_dataset: str = "eval_in_distribution"):
     mode_str = "Text Skills" if use_skills else "NO-SKILL baseline"
     logger.info(f"=== {mode_str} Evaluation: {num_episodes} episodes ===")
     logger.info(f"Model: {model_path}")
@@ -123,13 +125,14 @@ def run_evaluation(model_path: str, num_episodes: int = 140, max_steps: int = 50
     ).to(device)
     model.eval()
 
-    config = make_env_config(top_k=top_k, history_length=history_length, use_skills=use_skills)
+    config = make_env_config(top_k=top_k, history_length=history_length, use_skills=use_skills,
+                             eval_dataset=eval_dataset)
     alf_config_path = str(SKILLRL_ROOT / "agent_system" / "environments" / "env_package" / "alfworld" / "configs" / "config_tw.yaml")
 
-    logger.info("Building ALFWorld environment...")
+    logger.info(f"Building ALFWorld environment (split={eval_dataset})...")
     raw_envs = build_alfworld_envs(
         alf_config_path, seed, env_num=1, group_n=1, is_train=False,
-        env_kwargs={"eval_dataset": "eval_in_distribution"},
+        env_kwargs={"eval_dataset": eval_dataset},
         resources_per_worker={"num_cpus": 1},
     )
     env_manager = AlfWorldEnvironmentManager(raw_envs, partial(alfworld_projection), config)
@@ -246,6 +249,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-skills", action="store_true",
                         help="Run TRUE no-skill baseline (no text skills in prompt). "
                              "Default: text skills included (use_skills_only_memory=True).")
+    parser.add_argument("--eval-dataset", type=str, default="eval_in_distribution",
+                        help="eval_in_distribution (valid_seen) or eval_out_of_distribution (valid_unseen)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -262,4 +267,5 @@ if __name__ == "__main__":
         max_new_tokens=args.max_new_tokens,
         history_length=args.history_length,
         use_skills=not args.no_skills,
+        eval_dataset=args.eval_dataset,
     )

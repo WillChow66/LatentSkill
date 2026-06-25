@@ -157,6 +157,359 @@ def prep_resume():
     return "prepped global_step_15 from best (iter=15)"
 
 
+@app.function(image=image, gpu="H200:4", cpu=48, volumes={"/vol": vol},
+              timeout=6 * 3600,
+              secrets=[modal.Secret.from_name("openai-secret"),
+                       modal.Secret.from_name("wandb-secret")])
+def val_eval(ckpt_step: int, eval_dataset: str = "eval_in_distribution", val_size: int = 140):
+    """RIGOROUS offline eval (addresses val-selection bias): load a SPECIFIC RL
+    checkpoint via val_only + resume_path and evaluate on the FULL fixed test set
+    (eval_in_distribution=valid_seen / eval_out_of_distribution=valid_unseen, 140 ep),
+    NOT the 64-ep in-loop val. Same env/latent-injection/parser harness as training.
+    Run several ckpts (incl. final, unbiased) so we don't cherry-pick the val peak."""
+    import os, subprocess, threading, re, math
+    os.environ.update(RL_ENV)
+    subprocess.run(["pip", "install", "-e", ".", "--no-deps"], cwd="/root/app/SkillRL", check=False)
+    actor = "/vol/rl_assets/actor_k8_expanded_vocab"
+    ckpt = f"/vol/rl_assets/rl_k8_v2_out/global_step_{ckpt_step}"
+    assert os.path.exists(ckpt), f"ckpt missing: {ckpt}"
+    # one clean batch of val_size distinct games: parquet rows == val_batch_size
+    # (tile the 64-row test driver; env samples val_size games from the eval pool, seeded)
+    import pyarrow as pa, pyarrow.parquet as pq
+    base = pq.read_table("/vol/rl_assets/rl_parquet/test.parquet")
+    tbl = pa.concat_tables([base] * math.ceil(val_size / base.num_rows)).slice(0, val_size)
+    valp = f"/vol/rl_assets/rl_parquet/val_{val_size}.parquet"
+    pq.write_table(tbl, valp)
+    out = f"/vol/rl_assets/eval_out/{eval_dataset}_step{ckpt_step}_n{val_size}"
+    os.makedirs(out, exist_ok=True)
+    logf = f"{out}/eval.log"
+    cmd = [
+        "python3", "-m", "verl.trainer.main_ppo",
+        "algorithm.adv_estimator=grpo",
+        "data.train_files=/vol/rl_assets/rl_parquet/train.parquet",
+        f"data.val_files={valp}",
+        "data.train_batch_size=16",
+        f"data.val_batch_size={val_size}",
+        "data.max_prompt_length=4096", "data.max_response_length=512",
+        "data.filter_overlong_prompts=True", "data.truncation=error",
+        "data.return_raw_chat=True",
+        f"actor_rollout_ref.model.path={actor}",
+        "actor_rollout_ref.actor.optim.lr=1e-6",
+        "actor_rollout_ref.model.use_remove_padding=True",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=128",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.actor.use_kl_loss=True",
+        "actor_rollout_ref.actor.kl_loss_coef=0.01",
+        "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
+        "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        "actor_rollout_ref.actor.fsdp_config.param_offload=True",
+        "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=4",
+        "actor_rollout_ref.rollout.name=vllm",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
+        "actor_rollout_ref.rollout.enable_chunked_prefill=True",
+        "actor_rollout_ref.rollout.enforce_eager=False",
+        "actor_rollout_ref.rollout.free_cache_engine=False",
+        "actor_rollout_ref.rollout.max_num_batched_tokens=8192",
+        "actor_rollout_ref.rollout.max_num_seqs=512",
+        "actor_rollout_ref.rollout.val_kwargs.temperature=0.4",
+        "actor_rollout_ref.rollout.val_kwargs.do_sample=True",
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.ref.fsdp_config.param_offload=True",
+        "algorithm.use_kl_in_reward=False",
+        "env.env_name=alfworld/AlfredTWEnv",
+        "env.seed=0", "env.max_steps=50", "env.rollout.n=8",
+        "env.resources_per_worker.num_cpus=0.1",
+        "+env.use_skills_only_memory=True",
+        "+env.skills_only_memory.skills_json_path=memory_data/alfworld/claude_style_skills.json",
+        "+env.skills_only_memory.top_k=6",
+        "+env.skills_only_memory.latent_token_mode=True",
+        "+env.skills_only_memory.latents_per_skill=8",
+        "+env.skills_only_memory.enable_dynamic_update=False",
+        "trainer.critic_warmup=0",
+        "trainer.logger=[console]",
+        "trainer.project_name=latentskill",
+        f"trainer.experiment_name=eval_{eval_dataset}_step{ckpt_step}",
+        "trainer.n_gpus_per_node=4", "trainer.nnodes=1",
+        f"trainer.default_local_dir={out}",
+        "trainer.val_only=True",
+        "trainer.resume_mode=resume_path",
+        f"trainer.resume_from_path={ckpt}",
+    ]
+    # in_distribution is the config default → only override for OOD (avoids hydra
+    # struct-override risk on the proven in-dist path)
+    if eval_dataset != "eval_in_distribution":
+        cmd.append(f"env.alfworld.eval_dataset={eval_dataset}")
+    print("=== VAL_EVAL:", " ".join(cmd))
+    stop = threading.Event()
+    def _commit():
+        while not stop.wait(120):
+            try:
+                vol.commit()
+            except Exception:
+                pass
+    threading.Thread(target=_commit, daemon=True).start()
+    with open(logf, "w") as f:
+        try:
+            subprocess.run(cmd, cwd="/root/app/SkillRL", check=True,
+                           stdout=f, stderr=subprocess.STDOUT)
+        finally:
+            stop.set()
+            vol.commit()
+    txt = open(logf).read()
+    m = re.findall(r"val/success_rate[:=]\s*([0-9.]+)", txt)
+    sr = m[-1] if m else "PARSE_FAIL"
+    print(f"=== VAL_RESULT step={ckpt_step} dataset={eval_dataset} n={val_size} success_rate={sr} ===")
+    return f"step{ckpt_step} {eval_dataset} n={val_size} success_rate={sr}"
+
+
+@app.function(image=image, gpu="H200:4", cpu=48, volumes={"/vol": vol},
+              timeout=6 * 3600,
+              secrets=[modal.Secret.from_name("openai-secret"),
+                       modal.Secret.from_name("wandb-secret")])
+def val_eval_text(model_path: str = "/vol/rl_assets/skillrl_text_rl_hf",
+                  eval_dataset: str = "eval_in_distribution", val_size: int = 140):
+    """Fair-comparison eval of the SkillRL TEXT-RL ckpt on the SAME harness/eval set
+    as our latent eval. Differences vs val_eval: model.path = SkillRL ckpt (final HF
+    model, NO resume), latent_token_mode=False (text skills injected, not SKILL tokens),
+    max_prompt 6000 / max_response 1024 (SkillRL's native — don't truncate their long
+    text skills). Same env/parser/eval set (140 valid_seen / 134 valid_unseen)."""
+    import os, subprocess, threading, re, math
+    os.environ.update(RL_ENV)
+    subprocess.run(["pip", "install", "-e", ".", "--no-deps"], cwd="/root/app/SkillRL", check=False)
+    assert os.path.exists(f"{model_path}/config.json"), f"model missing: {model_path}"
+    import pyarrow as pa, pyarrow.parquet as pq
+    base = pq.read_table("/vol/rl_assets/rl_parquet/test.parquet")
+    tbl = pa.concat_tables([base] * math.ceil(val_size / base.num_rows)).slice(0, val_size)
+    valp = f"/vol/rl_assets/rl_parquet/val_{val_size}.parquet"
+    pq.write_table(tbl, valp)
+    tag = model_path.rstrip("/").split("/")[-1]
+    out = f"/vol/rl_assets/eval_out/TEXT_{tag}_{eval_dataset}_n{val_size}"
+    os.makedirs(out, exist_ok=True)
+    logf = f"{out}/eval.log"
+    cmd = [
+        "python3", "-m", "verl.trainer.main_ppo",
+        "algorithm.adv_estimator=grpo",
+        "data.train_files=/vol/rl_assets/rl_parquet/train.parquet",
+        f"data.val_files={valp}",
+        "data.train_batch_size=16", f"data.val_batch_size={val_size}",
+        "data.max_prompt_length=6000", "data.max_response_length=1024",  # SkillRL native
+        "data.filter_overlong_prompts=True", "data.truncation=error", "data.return_raw_chat=True",
+        f"actor_rollout_ref.model.path={model_path}",
+        "actor_rollout_ref.actor.optim.lr=1e-6",
+        "actor_rollout_ref.model.use_remove_padding=True",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=128",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.actor.use_kl_loss=True", "actor_rollout_ref.actor.kl_loss_coef=0.01",
+        "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
+        "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        "actor_rollout_ref.actor.fsdp_config.param_offload=True",
+        "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=4",
+        "actor_rollout_ref.rollout.name=vllm",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
+        "actor_rollout_ref.rollout.enable_chunked_prefill=True",
+        "actor_rollout_ref.rollout.enforce_eager=False",
+        "actor_rollout_ref.rollout.free_cache_engine=False",
+        "actor_rollout_ref.rollout.max_num_batched_tokens=12288",
+        "actor_rollout_ref.rollout.max_num_seqs=512",
+        "actor_rollout_ref.rollout.val_kwargs.temperature=0.4",
+        "actor_rollout_ref.rollout.val_kwargs.do_sample=True",
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.ref.fsdp_config.param_offload=True",
+        "algorithm.use_kl_in_reward=False",
+        "env.env_name=alfworld/AlfredTWEnv",
+        "env.seed=0", "env.max_steps=50", "env.rollout.n=8",
+        "env.resources_per_worker.num_cpus=0.1",
+        "+env.use_skills_only_memory=True",
+        "+env.skills_only_memory.skills_json_path=memory_data/alfworld/claude_style_skills.json",
+        "+env.skills_only_memory.top_k=6",
+        "+env.skills_only_memory.latent_token_mode=False",   # TEXT skills, not latent tokens
+        "+env.skills_only_memory.enable_dynamic_update=False",
+        "trainer.critic_warmup=0", "trainer.logger=[console]",
+        "trainer.project_name=latentskill",
+        f"trainer.experiment_name=eval_TEXT_{eval_dataset}",
+        "trainer.n_gpus_per_node=4", "trainer.nnodes=1",
+        f"trainer.default_local_dir={out}",
+        "trainer.val_only=True", "trainer.resume_mode=disable",
+    ]
+    if eval_dataset != "eval_in_distribution":
+        cmd.append(f"env.alfworld.eval_dataset={eval_dataset}")
+    print("=== VAL_EVAL_TEXT:", " ".join(cmd))
+    stop = threading.Event()
+    def _commit():
+        while not stop.wait(120):
+            try:
+                vol.commit()
+            except Exception:
+                pass
+    threading.Thread(target=_commit, daemon=True).start()
+    with open(logf, "w") as f:
+        try:
+            subprocess.run(cmd, cwd="/root/app/SkillRL", check=True, stdout=f, stderr=subprocess.STDOUT)
+        finally:
+            stop.set()
+            vol.commit()
+    txt = open(logf).read()
+    games = re.findall(r"Overall we have (\d+) games in split=([a-z_]+)", txt)
+    m = re.findall(r"val/success_rate[:=]\s*([0-9.]+)", txt)
+    sr = m[-1] if m else "PARSE_FAIL"
+    print(f"=== VAL_RESULT_TEXT model={tag} dataset={eval_dataset} n={val_size} success_rate={sr} games={games} ===")
+    return f"TEXT {tag} {eval_dataset} n={val_size} success_rate={sr}"
+
+
+@app.function(image=image, gpu="H200", cpu=16, volumes={"/vol": vol}, timeout=12 * 3600,
+              secrets=[modal.Secret.from_name("openai-secret"),
+                       modal.Secret.from_name("wandb-secret")])
+def eval_text_offline(model_path: str = "/vol/rl_assets/skillrl_text_rl_hf",
+                      eval_dataset: str = "eval_in_distribution", num_episodes: int = 140):
+    """FAITHFUL SkillRL eval on the canonical eval_text_alfworld.py harness (single-model
+    HF generate, SEQUENTIAL — the harness that reproduced their 89.9% as 88.6%, NOT verl
+    val_only which scores text skills ~3pp low). ~4-5h/split (sequential). For valid_seen
+    (140) re-confirm + valid_unseen (134) = SkillRL's faithful OOD (never measured)."""
+    import os, subprocess, threading, json
+    os.environ.update(RL_ENV)
+    subprocess.run(["pip", "install", "-e", ".", "--no-deps"], cwd="/root/app/SkillRL", check=False)
+    assert os.path.exists(f"{model_path}/config.json"), f"model missing: {model_path}"
+    tag = model_path.rstrip("/").split("/")[-1]
+    os.makedirs("/vol/rl_assets/eval_out", exist_ok=True)
+    out = f"/vol/rl_assets/eval_out/TEXTHARNESS_{tag}_{eval_dataset}_n{num_episodes}.json"
+    cmd = [
+        "python3", "-m", "src.eval_text_alfworld",
+        "--model", model_path,
+        "--eval-dataset", eval_dataset,
+        "--num-episodes", str(num_episodes),
+        "--max-steps", "50", "--temperature", "0.4", "--top-p", "1.0",
+        "--top-k", "6", "--history-length", "10",
+        "--output", out,
+    ]
+    print("=== EVAL_TEXT:", " ".join(cmd))
+    stop = threading.Event()
+    def _commit():
+        while not stop.wait(120):
+            try:
+                vol.commit()
+            except Exception:
+                pass
+    threading.Thread(target=_commit, daemon=True).start()
+    try:
+        subprocess.run(cmd, cwd="/root/app", check=True)
+    finally:
+        stop.set()
+        vol.commit()
+    sr = "?"
+    try:
+        sr = json.load(open(out)).get("overall_success_rate", "?")
+    except Exception:
+        pass
+    print(f"=== EVAL_TEXT_RESULT model={tag} dataset={eval_dataset} n={num_episodes} success_rate={sr} ===")
+    return f"eval_text {tag} {eval_dataset} n={num_episodes} sr={sr}"
+
+
+@app.function(image=image, gpu="H200:4", cpu=64, volumes={"/vol": vol},
+              timeout=6 * 3600,
+              secrets=[modal.Secret.from_name("openai-secret"),
+                       modal.Secret.from_name("wandb-secret")])
+def val_eval_text(model_path: str = "/vol/rl_assets/skillrl_text_rl_hf",
+                  eval_dataset: str = "eval_in_distribution", val_size: int = 140,
+                  max_prompt: int = 6000, max_response: int = 1024, tag: str = "skillrl"):
+    """SAME harness as val_eval but for a TEXT-skill HF checkpoint (e.g. SkillRL's RL
+    ckpt): model.path=the HF model directly (resume_mode=disable, no FSDP resume),
+    latent_token_mode=False (text skills injected as prompt text, top_k=6), and SkillRL's
+    native max_prompt/response so its long text skills aren't truncated. Full-pool eval
+    on valid_seen/valid_unseen for an apples-to-apples vs our latent ckpt."""
+    import os, subprocess, threading, re, math
+    os.environ.update(RL_ENV)
+    subprocess.run(["pip", "install", "-e", ".", "--no-deps"], cwd="/root/app/SkillRL", check=False)
+    assert os.path.exists(f"{model_path}/config.json"), f"model missing: {model_path}"
+    import pyarrow as pa, pyarrow.parquet as pq
+    base = pq.read_table("/vol/rl_assets/rl_parquet/test.parquet")
+    tbl = pa.concat_tables([base] * math.ceil(val_size / base.num_rows)).slice(0, val_size)
+    valp = f"/vol/rl_assets/rl_parquet/val_{val_size}.parquet"
+    pq.write_table(tbl, valp)
+    out = f"/vol/rl_assets/eval_out/{tag}_{eval_dataset}_n{val_size}"
+    os.makedirs(out, exist_ok=True)
+    logf = f"{out}/eval.log"
+    cmd = [
+        "python3", "-m", "verl.trainer.main_ppo",
+        "algorithm.adv_estimator=grpo",
+        "data.train_files=/vol/rl_assets/rl_parquet/train.parquet",
+        f"data.val_files={valp}",
+        "data.train_batch_size=16",
+        f"data.val_batch_size={val_size}",
+        f"data.max_prompt_length={max_prompt}",
+        f"data.max_response_length={max_response}",
+        "data.filter_overlong_prompts=True", "data.truncation=error",
+        "data.return_raw_chat=True",
+        f"actor_rollout_ref.model.path={model_path}",
+        "actor_rollout_ref.actor.optim.lr=1e-6",
+        "actor_rollout_ref.model.use_remove_padding=True",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=128",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.actor.use_kl_loss=True",
+        "actor_rollout_ref.actor.kl_loss_coef=0.01",
+        "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
+        "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        "actor_rollout_ref.actor.fsdp_config.param_offload=True",
+        "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=4",
+        "actor_rollout_ref.rollout.name=vllm",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
+        "actor_rollout_ref.rollout.enable_chunked_prefill=True",
+        "actor_rollout_ref.rollout.enforce_eager=False",
+        "actor_rollout_ref.rollout.free_cache_engine=False",
+        "actor_rollout_ref.rollout.max_num_batched_tokens=8192",
+        "actor_rollout_ref.rollout.max_num_seqs=512",
+        "actor_rollout_ref.rollout.val_kwargs.temperature=0.4",
+        "actor_rollout_ref.rollout.val_kwargs.do_sample=True",
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.ref.fsdp_config.param_offload=True",
+        "algorithm.use_kl_in_reward=False",
+        "env.env_name=alfworld/AlfredTWEnv",
+        "env.seed=0", "env.max_steps=50", "env.rollout.n=8",
+        "env.resources_per_worker.num_cpus=0.1",
+        "+env.use_skills_only_memory=True",
+        "+env.skills_only_memory.skills_json_path=memory_data/alfworld/claude_style_skills.json",
+        "+env.skills_only_memory.top_k=6",
+        "+env.skills_only_memory.latent_token_mode=False",   # TEXT skills (not SKILL tokens)
+        "+env.skills_only_memory.enable_dynamic_update=False",
+        "trainer.critic_warmup=0",
+        "trainer.logger=[console]",
+        "trainer.project_name=latentskill",
+        f"trainer.experiment_name=eval_{tag}_{eval_dataset}",
+        "trainer.n_gpus_per_node=4", "trainer.nnodes=1",
+        f"trainer.default_local_dir={out}",
+        "trainer.val_only=True",
+        "trainer.resume_mode=disable",
+    ]
+    if eval_dataset != "eval_in_distribution":
+        cmd.append(f"env.alfworld.eval_dataset={eval_dataset}")
+    print("=== VAL_EVAL_TEXT:", " ".join(cmd))
+    stop = threading.Event()
+    def _commit():
+        while not stop.wait(120):
+            try:
+                vol.commit()
+            except Exception:
+                pass
+    threading.Thread(target=_commit, daemon=True).start()
+    with open(logf, "w") as f:
+        try:
+            subprocess.run(cmd, cwd="/root/app/SkillRL", check=True,
+                           stdout=f, stderr=subprocess.STDOUT)
+        finally:
+            stop.set()
+            vol.commit()
+    txt = open(logf).read()
+    m = re.findall(r"val/success_rate[:=]\s*([0-9.]+)", txt)
+    sr = m[-1] if m else "PARSE_FAIL"
+    print(f"=== VAL_RESULT tag={tag} dataset={eval_dataset} n={val_size} success_rate={sr} ===")
+    return f"{tag} {eval_dataset} n={val_size} success_rate={sr}"
+
+
 @app.function(image=image, gpu="H200:4", cpu=32, volumes={"/vol": vol},
               timeout=24 * 3600,
               # SELF-HEAL: 150 epochs (~26h) > Modal's 24h timeout cap, so the run
@@ -171,7 +524,7 @@ def prep_resume():
               secrets=[modal.Secret.from_name("openai-secret"),
                        modal.Secret.from_name("wandb-secret")])
 def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
-             group_size: int = 8, test_freq: int = 5):
+             group_size: int = 8, test_freq: int = 5, x2: bool = False):
     import os
     os.environ.update(RL_ENV)
     # editable-install verl fork so `import verl` resolves to our patched copy
@@ -179,11 +532,11 @@ def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
                    cwd="/root/app/SkillRL", check=False)
 
     actor = "/vol/rl_assets/actor_k8_expanded_vocab"
-    # v2: clean restart from the baked actor. v1's checkpoints are CORRUPT — the
-    # original run was hard-killed before any vol.commit(), so its big shard files
-    # have valid sizes but truncated zip tails (torch.load → "failed finding central
-    # directory"). The periodic-commit fix above makes v2's checkpoints durable.
-    out = "/vol/rl_assets/rl_k8_v2_out"
+    # v2 (x2=False): clean restart from the baked actor, X2 dynamic skill bank OFF.
+    # x2=True: evolve-ON — Composer kept alive per rank (frozen encoder copy + trained
+    # query_latents) so failed-traj → o3-mini → new skill text → Composer.encode → latent
+    # → added to actor vocab + vLLM mid-RL. Fresh out dir so it doesn't touch evolve-off.
+    out = "/vol/rl_assets/rl_k8_x2_out" if x2 else "/vol/rl_assets/rl_k8_v2_out"
     os.makedirs(out, exist_ok=True)
     assert os.path.exists(actor), f"baked actor missing: {actor}"
 
@@ -238,11 +591,11 @@ def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
         "+env.skills_only_memory.top_k=6",
         "+env.skills_only_memory.latent_token_mode=True",
         "+env.skills_only_memory.latents_per_skill=8",   # the k-hardcode fix
-        "+env.skills_only_memory.enable_dynamic_update=False",  # X2 OFF in v1
+        f"+env.skills_only_memory.enable_dynamic_update={x2}",  # X2 on/off
         "trainer.critic_warmup=0",
         "trainer.logger=[console,wandb]",
         "trainer.project_name=latentskill",
-        "trainer.experiment_name=rl_k8_static_modal",
+        f"trainer.experiment_name=rl_k8_{'x2' if x2 else 'static'}_modal",
         "trainer.n_gpus_per_node=4",
         "trainer.nnodes=1",
         f"trainer.default_local_dir={out}",
@@ -252,6 +605,15 @@ def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
         "trainer.val_before_train=True",
         "trainer.max_actor_ckpt_to_keep=2",
     ]
+    if x2:
+        # Composer kept alive per rank (Plan C: frozen encoder copy + trained query_latents)
+        # so ray_trainer's X2 hook can encode o3-mini-proposed new skills → latent → vocab.
+        cmd += [
+            "+actor_rollout_ref.composer.latents_per_skill=8",
+            "+actor_rollout_ref.composer.pretrained_query_latents=/vol/rl_assets/composer_k8_query_latents.pt",
+            "+actor_rollout_ref.composer.skills_json_path=memory_data/alfworld/claude_style_skills.json",
+            "+actor_rollout_ref.composer.skill_token_map_path=/vol/rl_assets/actor_k8_expanded_vocab/skill_token_map.json",
+        ]
     print("=== RL:", " ".join(cmd))
     # DURABILITY: Modal volume writes aren't persisted until vol.commit(); a hard
     # mid-run kill else leaves the in-flight checkpoint with missing FSDP rank shards
