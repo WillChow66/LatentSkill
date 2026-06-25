@@ -531,9 +531,17 @@ Run via deploy+spawn (fire-and-forget). ~1h/eval (40min env-init overhead + ~17m
 
 **FINAL ckpt (no cherry-pick) = 92.9% on full 140-ep in-dist** — HIGHER than the in-loop
 val (~87% late / 92.2% peak), so the result is NOT a lucky 64-ep val draw; it BEATS the
-text-RL 88.6% anchor (same 140-ep protocol). Concern resolved in our favor. TODO: fill
-130/140/best + OOD rows; ideally re-eval the text-RL ckpt on this same harness for airtight
-apples-to-apples.
+text-RL 88.6% anchor (same 140-ep protocol). Concern resolved in our favor.
+
+⚠️ **`max_actor_ckpt_to_keep=2` DID prune** (contrary to first impression): only
+`global_step_140` + `global_step_150` keep their 12 FSDP shards; ALL older ckpts AND
+`best` have EMPTY actor/ dirs (shards deleted → resume FileNotFoundError; step130 eval
+died on this). So (a) volume is only ~170GB not 1.3TB, (b) we can ONLY eval 140 & 150
+(the val-peak best/85 is unrecoverable). **Fine** — we report the UNBIASED late ckpts,
+not a val-selected one. **Future runs: set `max_actor_ckpt_to_keep` high (or -1) if you
+want to eval the trajectory / a val-peak ckpt.** Rigorous table = {140,150} × {in-dist,
+OOD valid_unseen}, 140 ep each (150-indist=92.9% done; others running). TODO: re-eval the
+text-RL ckpt on this same harness for airtight apples-to-apples.
 
 ## Critical Version Pins
 
