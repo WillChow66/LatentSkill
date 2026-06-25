@@ -642,3 +642,23 @@ and propose new skill text → Composer encodes → vocab embedding row.
 - SkillRL paper: `related work/SkillRL.pdf`
 - LatentMem repo: `LatentMem/` (cloned locally)
 - TokMem repo: `TokMem/` (cloned locally)
+
+### 🏁 FAIR COMPARISON — latent (ours) vs SkillRL text-RL, SAME harness, FULL eval sets (Jun 25)
+
+Both via verl `val_only` (same env/parser), FULL standard ALFWorld eval sets (valid_seen
+140 / valid_unseen 134 = solvable compiled games). Ours = latent k=8 step150 (latent_token_mode
+=True, max_prompt 4096); SkillRL = their text-RL ckpt (latent_token_mode=False text skills,
+max_prompt 6000 native). Both X2 OFF, same static claude_style_skills.json (44 skills), T=0.4.
+
+| method | in-dist (valid_seen, 140) | OOD (valid_unseen, 134) |
+|---|:-:|:-:|
+| **Ours (latent k=8, step150)** | **92.9%** | **88.1%** |
+| SkillRL (text-RL ckpt) | 85.7% | 76.9% |
+| **Δ** | **+7.2pp** | **+11.2pp** |
+
+(pooled seen+unseen: ours 90.6% vs SkillRL 81.4%.) Ours wins on BOTH, with a LARGER OOD
+margin → latent skills generalize better to unseen rooms, at ~half the token cost.
+CAVEAT (honest): SkillRL on our harness (85.7% in-dist) is below its paper's 89.9% — we eval
+its ckpt with the static base skills (its trained DYNAMIC skill bank isn't reproduced), which
+may under-represent it; even vs its own 89.9%, ours (92.9%, X2 OFF) is ahead. OOD is novel
+(SkillRL paper reports no unseen number). Our step140 corroborates: in-dist 92.9%, OOD 82.1%.
