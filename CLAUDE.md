@@ -513,10 +513,27 @@ global_step_10..150 + best all durable). In-loop val (64 ep, test_freq=5) over G
 
 **baseline 48.4% → best ckpt 92.2% (step 85); late phase stable ~85-92%.** This
 **reaches/exceeds the text-RL ceiling (88.6%)** at ~half the token cost → core thesis
-proven: latent skills are RL-optimizable to text-skill-RL parity. CAVEAT: this is the
-in-loop val (64 ep); the headline number must be the standard **140-ep offline eval**
-(`eval_latent_alfworld.py`) on `rl_k8_v2_out/best` — TODO. Val noise ±, curve bounces
-79.7-92.2% late, so report best-ckpt + a 3-seed offline eval, not the single peak.
+proven: latent skills are RL-optimizable to text-skill-RL parity. CAVEAT: above is the in-loop val (64 ep). Headline = rigorous offline eval below.
+
+### ✅ RIGOROUS OFFLINE EVAL (Jun 23) — val-selection-bias check, FULL 140-ep test
+
+Concern (user): in-loop `best` is picked on 64 eps → may not hold on the full test.
+Fix: `val_eval()` in modal_rl.py = verl `val_only` + `resume_mode=resume_path`
+resume_from a SPECIFIC `global_step_N`, eval on the FULL fixed test set (val parquet
+tiled to 140 rows; `env.alfworld.eval_dataset=eval_in_distribution`=valid_seen /
+`eval_out_of_distribution`=valid_unseen), same env/latent/parser harness as training.
+Run via deploy+spawn (fire-and-forget). ~1h/eval (40min env-init overhead + ~17min val).
+
+| ckpt | test set | n | success_rate |
+|---|---|:-:|:-:|
+| **global_step_150 (FINAL, unbiased)** | in-distribution (valid_seen) | 140 | **92.9%** ✓ |
+| global_step_130/140, best(85), OOD | (running) | 140 | TBD |
+
+**FINAL ckpt (no cherry-pick) = 92.9% on full 140-ep in-dist** — HIGHER than the in-loop
+val (~87% late / 92.2% peak), so the result is NOT a lucky 64-ep val draw; it BEATS the
+text-RL 88.6% anchor (same 140-ep protocol). Concern resolved in our favor. TODO: fill
+130/140/best + OOD rows; ideally re-eval the text-RL ckpt on this same harness for airtight
+apples-to-apples.
 
 ## Critical Version Pins
 
