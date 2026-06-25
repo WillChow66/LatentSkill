@@ -499,8 +499,9 @@ the spawned call dies. Must be `modal deploy` first.
 
 ### 🏆 v2 RESULT (Jun 23) — latent-skill RL MATCHES/BEATS text-skill RL
 
-Deployed+spawned run survived unattended to step 131/150 (no deaths). In-loop val
-(64 ep, test_freq=5) success_rate over GRPO steps:
+Deployed+spawned run **COMPLETED all 150 epochs unattended** (no deaths; ckpts
+global_step_10..150 + best all durable). In-loop val (64 ep, test_freq=5) over GRPO steps
+(late phase steps 100-145 mean ≈ 87.3%, range 79.7-92.2):
 
 | step | val | step | val | step | val |
 |:-:|:-:|:-:|:-:|:-:|:-:|
