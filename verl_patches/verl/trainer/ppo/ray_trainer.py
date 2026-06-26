@@ -895,6 +895,15 @@ class RayPPOTrainer:
         )
 
         if new_skills:
+            # X2: If latent_token_mode is on, reassign skill_ids to pre-allocated
+            # dyn slots and encode+write their latent embeddings into actor.
+            latent_mode = update_config.get('latent_token_mode', False)
+            if latent_mode:
+                new_skills = self._x2_assign_and_encode_dyn_skills(new_skills)
+                if not new_skills:
+                    print("[SkillUpdate] All dyn slots are full or encoding failed, skipping")
+                    return
+
             # Add to training envs only.
             # Do NOT add to val_envs here: skills derived from validation
             # failures must not be fed back into the validation memory of the
@@ -914,8 +923,161 @@ class RayPPOTrainer:
             save_path = os.path.join(save_dir, f'updated_skills_step{self.global_steps}.json')
             train_memory.save_skills(save_path)
             print(f"[SkillUpdate] Saved updated skill bank to {save_path}")
+
+            # Persist skill_token_map.json with dyn slot assignments
+            if latent_mode and hasattr(self, 'skill_token_map'):
+                import json as _json
+                token_map_path = os.path.join(save_dir, f'skill_token_map_step{self.global_steps}.json')
+                with open(token_map_path, 'w') as f:
+                    _json.dump(self.skill_token_map, f, indent=2)
+                print(f"[SkillUpdate] Saved skill_token_map to {token_map_path}")
         else:
             print("[SkillUpdate] No new skills generated")
+
+    # ------------------------------------------------------------------ #
+    # X2: Dynamic skill bank — pure latent encoding + FSDP embed write    #
+    # ------------------------------------------------------------------ #
+
+    def _x2_init_composer_and_token_map(self):
+        """Lazy-init Composer (CPU) for dyn skill encoding, and load skill_token_map from v4 ckpt."""
+        if getattr(self, '_x2_initialized', False):
+            return
+
+        import json as _json
+        import sys as _sys
+        # src.skill_composer must be importable. On the cluster it lived at
+        # /u/xzhou10/latentskill; on Modal it's on PYTHONPATH (/root/app). Only add
+        # the cluster path if it actually exists, else rely on the existing sys.path.
+        repo_root = '/u/xzhou10/latentskill'
+        if os.path.isdir(repo_root) and repo_root not in _sys.path:
+            _sys.path.insert(0, repo_root)
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from src.skill_composer import SkillComposer
+
+        model_path = self.config.actor_rollout_ref.model.path
+        print(f"[X2] Loading Composer encoder (CPU) from {model_path}...")
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        encoder = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        ).cpu().eval()
+        for p in encoder.parameters():
+            p.requires_grad = False
+
+        _k = int(self.config.env.skills_only_memory.get('latents_per_skill', 2))
+        composer = SkillComposer(encoder_model=encoder, latents_per_skill=_k).cpu()
+        ql_path = self.config.env.skills_only_memory.get('composer_query_latents_path')
+        if ql_path is None:
+            raise ValueError("X2 requires env.skills_only_memory.composer_query_latents_path to be set")
+        composer.load_pretrained(ql_path)
+        composer._tokenizer = tokenizer  # needed by encode_skills
+        self.composer = composer
+
+        # Load skill_token_map — prefer a resumed state from save_dir if present,
+        # else fall back to v4's pristine map. This keeps dyn-slot assignments
+        # consistent after a mid-training restart (actor FSDP ckpt already has
+        # the corresponding embed rows populated).
+        save_dir = self.config.trainer.get('default_local_dir', './outputs')
+        import glob as _glob
+        resumed_map_path = None
+        if os.path.isdir(save_dir):
+            candidates = _glob.glob(os.path.join(save_dir, 'skill_token_map_step*.json'))
+            if candidates:
+                def _step_of(p):
+                    m = __import__('re').search(r'skill_token_map_step(\d+)\.json', p)
+                    return int(m.group(1)) if m else -1
+                resumed_map_path = max(candidates, key=_step_of)
+
+        if resumed_map_path:
+            with open(resumed_map_path) as f:
+                self.skill_token_map = _json.load(f)
+            print(f"[X2] Resumed skill_token_map from {resumed_map_path}")
+        else:
+            token_map_path = os.path.join(model_path, 'skill_token_map.json')
+            with open(token_map_path) as f:
+                self.skill_token_map = _json.load(f)
+            print(f"[X2] Fresh skill_token_map from {token_map_path}")
+        n_dyn = sum(1 for k in self.skill_token_map if k.startswith('dyn_'))
+        n_dyn_used = sum(1 for k, v in self.skill_token_map.items() if k.startswith('dyn_') and v.get('hash'))
+        print(f"[X2] Map: {len(self.skill_token_map) - n_dyn} static + {n_dyn} dyn slots ({n_dyn_used} already used)")
+
+        self._x2_initialized = True
+
+    def _x2_next_free_dyn_slot(self) -> str:
+        """Find next unused dyn_NNN slot in skill_token_map (hash=None means unused)."""
+        import re as _re
+        pattern = _re.compile(r'^dyn_(\d+)$')
+        slot_nums = sorted([int(pattern.match(k).group(1)) for k in self.skill_token_map if pattern.match(k)])
+        for n in slot_nums:
+            slot_id = f"dyn_{n:03d}"
+            if self.skill_token_map[slot_id].get('hash') is None:
+                return slot_id
+        return None  # all slots taken
+
+    def _x2_format_skill_text(self, skill: dict) -> str:
+        """Format a skill dict into the text Composer expects (matches static skill format)."""
+        title = skill.get('title', '')
+        principle = skill.get('principle', '')
+        text = f"**{title}**: {principle}"
+        when = skill.get('when_to_apply')
+        if when:
+            text += f" Apply when: {when}"
+        return text
+
+    def _x2_assign_and_encode_dyn_skills(self, new_skills: list) -> list:
+        """Assign each new skill to a free dyn slot, encode via Composer, write to actor embed.
+
+        Returns list of (possibly-reassigned) skills that were successfully
+        placed and encoded. Drops skills if no dyn slot is free or encoding
+        fails.
+        """
+        import hashlib as _hl
+        self._x2_init_composer_and_token_map()
+
+        latent_map = {}
+        assigned = []
+        for skill in new_skills:
+            slot_id = self._x2_next_free_dyn_slot()
+            if slot_id is None:
+                print("[X2] No free dyn slot available — skipping remaining skills")
+                break
+
+            skill = dict(skill)  # shallow copy, keep caller's list pristine
+            skill['skill_id'] = slot_id  # override LLM-returned id
+
+            text = self._x2_format_skill_text(skill)
+            try:
+                with torch.no_grad():
+                    latent_seq = self.composer.encode_skills([text])  # (1, k, D)
+                latent_seq = latent_seq[0].detach().cpu()  # (k, D)
+            except Exception as e:
+                print(f"[X2] Composer encoding failed for {slot_id}: {e}")
+                continue
+
+            slot = self.skill_token_map[slot_id]
+            # k-generic: write ALL k token rows (was hardcoded tid_a,tid_b for k=2;
+            # our k=8 token map has 8 ids/slot, so writing only 2 left 6 rows empty).
+            tids = slot['token_ids']
+            if len(tids) != latent_seq.shape[0]:
+                print(f"[X2] WARN {slot_id}: {len(tids)} token_ids vs {latent_seq.shape[0]} latents")
+            for _i, _tid in enumerate(tids[:latent_seq.shape[0]]):
+                latent_map[_tid] = latent_seq[_i].contiguous()
+
+            # Mark slot as used
+            slot['hash'] = _hl.md5(text.encode()).hexdigest()
+            slot['text'] = text[:200]
+            slot['assigned_at_step'] = self.global_steps
+
+            assigned.append(skill)
+            print(f"[X2] Assigned {slot_id} -> token_ids {slot['token_ids']}, encoded latent norm={latent_pair.norm().item():.3f}")
+
+        if assigned:
+            print(f"[X2] Writing {len(latent_map)} embed rows to FSDP actor...")
+            self.actor_rollout_wg.write_dyn_skill_embeds(latent_map)
+            print(f"[X2] Embed write complete.")
+
+        return assigned
 
     def _collect_failed_trajectories(
         self,

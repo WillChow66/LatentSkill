@@ -658,7 +658,7 @@ max_prompt 6000 native). Both X2 OFF, same static claude_style_skills.json (44 s
 
 (pooled seen+unseen: ours 90.6% vs SkillRL 81.4%.) Ours wins on BOTH, with a LARGER OOD
 margin → latent skills generalize better to unseen rooms, at ~half the token cost.
-CAVEAT (honest): SkillRL on our harness (85.7% in-dist) is below its paper's 89.9% — we eval
+CONFIRMED (Jun 25): SkillRL = 85.7% in-dist / 75.4% OOD on the SEQUENTIAL eval_text harness too (the one that gave 88.6% for the SkillRL ckpt months ago) — i.e. 85.7% is NOT a verl-harness artifact; it's the real score of their ckpt with STATIC base skills (their 89.9% used X2 dynamic skills we don't reproduce). So our latent (92.9/88.1) vs SkillRL-text (85.7/75.4) is clean: same harness, same static skills, both X2-off. CAVEAT (honest): SkillRL on our harness (85.7% in-dist) is below its paper's 89.9% — we eval
 its ckpt with the static base skills (its trained DYNAMIC skill bank isn't reproduced), which
 may under-represent it; even vs its own 89.9%, ours (92.9%, X2 OFF) is ahead. OOD is novel
 (SkillRL paper reports no unseen number). Our step140 corroborates: in-dist 92.9%, OOD 82.1%.

@@ -360,7 +360,7 @@ def val_eval_text(model_path: str = "/vol/rl_assets/skillrl_text_rl_hf",
     return f"TEXT {tag} {eval_dataset} n={val_size} success_rate={sr}"
 
 
-@app.function(image=image, gpu="H200", cpu=16, volumes={"/vol": vol}, timeout=12 * 3600,
+@app.function(image=image, gpu="L40S", cpu=16, volumes={"/vol": vol}, timeout=16 * 3600,
               secrets=[modal.Secret.from_name("openai-secret"),
                        modal.Secret.from_name("wandb-secret")])
 def eval_text_offline(model_path: str = "/vol/rl_assets/skillrl_text_rl_hf",
@@ -606,13 +606,11 @@ def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
         "trainer.max_actor_ckpt_to_keep=2",
     ]
     if x2:
-        # Composer kept alive per rank (Plan C: frozen encoder copy + trained query_latents)
-        # so ray_trainer's X2 hook can encode o3-mini-proposed new skills → latent → vocab.
+        # X2 path: ray_trainer lazy-inits a CPU Composer (encoder = actor model.path,
+        # query_latents from this path) and reads skill_token_map from model.path. It
+        # reads these from env.skills_only_memory.* (NOT actor_rollout_ref.composer.*).
         cmd += [
-            "+actor_rollout_ref.composer.latents_per_skill=8",
-            "+actor_rollout_ref.composer.pretrained_query_latents=/vol/rl_assets/composer_k8_query_latents.pt",
-            "+actor_rollout_ref.composer.skills_json_path=memory_data/alfworld/claude_style_skills.json",
-            "+actor_rollout_ref.composer.skill_token_map_path=/vol/rl_assets/actor_k8_expanded_vocab/skill_token_map.json",
+            "+env.skills_only_memory.composer_query_latents_path=/vol/rl_assets/composer_k8_query_latents.pt",
         ]
     print("=== RL:", " ".join(cmd))
     # DURABILITY: Modal volume writes aren't persisted until vol.commit(); a hard
