@@ -77,17 +77,17 @@ def build_v4(v3_ckpt: str, output_dir: str, num_dyn_slots: int = 100,
 
     logger.info(f"Zeroed {num_new_tokens} new rows in embed_tokens and lm_head")
 
-    # Verify: record token_ids for each dyn slot
+    # Verify: record token_ids for each dyn slot (k-generic: ALL latents_per_skill
+    # suffixes, not just a/b — k=8 was silently dropping 6 of 8 token rows per slot).
+    suffixes = ["a", "b"] if latents_per_skill == 2 else [chr(ord('a') + i) for i in range(latents_per_skill)]
     dyn_slot_map = {}
     for n in range(1, num_dyn_slots + 1):
         slot_id = f"dyn_{n:03d}"
-        tok_a = f"SKILL_dyn_{n:03d}_a"
-        tok_b = f"SKILL_dyn_{n:03d}_b"
-        id_a = tokenizer.convert_tokens_to_ids(tok_a)
-        id_b = tokenizer.convert_tokens_to_ids(tok_b)
+        toks = [f"SKILL_dyn_{n:03d}_{s}" for s in suffixes]
+        ids = [tokenizer.convert_tokens_to_ids(t) for t in toks]
         dyn_slot_map[slot_id] = {
-            "tokens": [tok_a, tok_b],
-            "token_ids": [id_a, id_b],
+            "tokens": toks,
+            "token_ids": ids,
             "hash": None,  # filled when a dyn skill is assigned
             "type": "general",
             "text": None,  # filled when a dyn skill is assigned

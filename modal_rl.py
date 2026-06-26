@@ -137,6 +137,33 @@ def diag():
     return "diag done"
 
 
+@app.function(image=image, gpu="L40S", volumes={"/vol": vol}, timeout=3600)
+def bake_v4_x2(num_dyn_slots: int = 100):
+    """X2 prerequisite: the k=8 baked actor has 44 static skills × 8 = 352 SKILL tokens
+    but ZERO dyn slots → X2's _x2_next_free_dyn_slot() returns None → all new skills
+    dropped → X2 is a silent no-op. This adds num_dyn_slots × 8 spare SKILL_dyn_NNN_*
+    rows (zero-init, filled by Composer at runtime) + extends skill_token_map.json.
+    Output: actor_k8_x2_vocab (the real X2 RL starting actor)."""
+    import os, subprocess
+    os.environ.update(RL_ENV)
+    src = "/vol/rl_assets/actor_k8_expanded_vocab"
+    out = "/vol/rl_assets/actor_k8_x2_vocab"
+    assert os.path.exists(f"{src}/skill_token_map.json"), f"need static map: {src}"
+    cmd = ["python3", "-m", "src.bake_sft_latents_into_v4",
+           "--v3-ckpt", src, "--output-dir", out,
+           "--num-dyn-slots", str(num_dyn_slots), "--latents-per-skill", "8"]
+    print("=== BAKE_V4_X2:", " ".join(cmd))
+    subprocess.run(cmd, cwd="/root/app", check=True)
+    vol.commit()
+    import json
+    m = json.load(open(f"{out}/skill_token_map.json"))
+    nstat = sum(1 for k in m if not k.startswith("dyn_"))
+    ndyn = sum(1 for k in m if k.startswith("dyn_"))
+    klen = len(m[list(m)[0]]["token_ids"])
+    print(f"=== BAKE_V4_X2 DONE: {nstat} static + {ndyn} dyn slots, k={klen} -> {out}")
+    return f"v4 x2 actor: {nstat} static + {ndyn} dyn (k={klen})"
+
+
 @app.function(image=image, volumes={"/vol": vol}, timeout=1800)
 def prep_resume():
     """Salvage the v1 run: its `best` ckpt (step15, 65.6%) is COMPLETE but the
@@ -531,11 +558,13 @@ def train_rl(epochs: int = 150, train_size: int = 16, val_size: int = 64,
     subprocess.run(["pip", "install", "-e", ".", "--no-deps"],
                    cwd="/root/app/SkillRL", check=False)
 
-    actor = "/vol/rl_assets/actor_k8_expanded_vocab"
-    # v2 (x2=False): clean restart from the baked actor, X2 dynamic skill bank OFF.
+    # x2=True needs the v4 actor WITH pre-allocated dyn_NNN slots (actor_k8_x2_vocab);
+    # the plain baked actor has 0 dyn slots → X2 would silently drop every new skill.
+    # x2=False uses the plain baked actor (evolve-off, the 92.9% run).
+    actor = "/vol/rl_assets/actor_k8_x2_vocab" if x2 else "/vol/rl_assets/actor_k8_expanded_vocab"
     # x2=True: evolve-ON — Composer kept alive per rank (frozen encoder copy + trained
     # query_latents) so failed-traj → o3-mini → new skill text → Composer.encode → latent
-    # → added to actor vocab + vLLM mid-RL. Fresh out dir so it doesn't touch evolve-off.
+    # → written into pre-allocated dyn vocab rows + vLLM mid-RL. Fresh out dir.
     out = "/vol/rl_assets/rl_k8_x2_out" if x2 else "/vol/rl_assets/rl_k8_v2_out"
     os.makedirs(out, exist_ok=True)
     assert os.path.exists(actor), f"baked actor missing: {actor}"
